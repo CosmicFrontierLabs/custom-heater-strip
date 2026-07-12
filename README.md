@@ -22,7 +22,9 @@ engine/      The heater design engine (pure library, no I/O):
   outline.rs    SVG → outline polygon in mm (usvg, 96 dpi convention)
   solver.rs     electrical solve: R = V²/P → trace width/pitch quadratic,
                 current-ceiling feasibility, post-route width refinement
-  serpentine.rs boustrophedon scanline fill of the outline
+  serpentine.rs boustrophedon scanline fill; rectangular, mitered (45°), or
+                smooth (true-arc) turnarounds — arcs emit G02/G03 in Gerber
+                and (arc …) tracks in KiCad
   preview.rs    SVG rendering of the routed design
   silk.rs       stroke-font silkscreen legend (specs printed on the board)
   kicad.rs      minimal .kicad_pcb writer (F.Cu segments + Edge.Cuts + F.SilkS)
@@ -68,7 +70,11 @@ cargo run -p backend -- --dev-mode
 
 ## Outline SVG conventions
 
-- One closed `<path>`; the largest closed subpath is used as the outline
+The UI can also synthesize a rectangle (width × height × corner radius)
+client-side, so no SVG is needed for simple strips. For uploads:
+
+- One closed `<path>` (or `<rect>`); the largest closed subpath is used as
+  the outline
 - Size the document in physical units (`width="100mm"`) — unitless SVGs are
   interpreted at 96 dpi with a warning
 - Concave outlines route only the widest section per row (a warning tells you

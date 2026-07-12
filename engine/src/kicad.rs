@@ -64,13 +64,26 @@ pub fn render(design: &Design) -> String {
         }
     }
 
-    // Serpentine as connected track segments on F.Cu.
-    for w in design.trace.windows(2) {
-        let _ = writeln!(
-            s,
-            "  (segment (start {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"F.Cu\") (net 1))",
-            w[0].x, w[0].y, w[1].x, w[1].y, design.trace_width_mm
-        );
+    // Serpentine as connected tracks on F.Cu: straight runs as segments,
+    // smooth turnarounds as true arc tracks (start/mid/end encoding).
+    for seg in &design.trace {
+        match seg {
+            crate::PathSeg::Line { a, b } => {
+                let _ = writeln!(
+                    s,
+                    "  (segment (start {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"F.Cu\") (net 1))",
+                    a.x, a.y, b.x, b.y, design.trace_width_mm
+                );
+            }
+            crate::PathSeg::Arc { a, b, .. } => {
+                let m = seg.arc_midpoint().expect("arc has midpoint");
+                let _ = writeln!(
+                    s,
+                    "  (arc (start {:.4} {:.4}) (mid {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"F.Cu\") (net 1))",
+                    a.x, a.y, m.x, m.y, b.x, b.y, design.trace_width_mm
+                );
+            }
+        }
     }
 
     s.push_str(")\n");

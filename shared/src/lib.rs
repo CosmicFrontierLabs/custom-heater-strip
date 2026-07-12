@@ -87,6 +87,46 @@ pub struct DesignRequest {
     pub min_gap_mm: f64,
     /// Clearance between the trace and the board outline, in mm.
     pub edge_margin_mm: f64,
+    /// Diameter of the solder terminal pads at the trace ends, in mm.
+    #[serde(default = "default_pad_diameter")]
+    pub pad_diameter_mm: f64,
+    /// How serpentine turnarounds are drawn.
+    #[serde(default)]
+    pub corner_style: CornerStyle,
+}
+
+/// Serpentine turnaround geometry, matching the corner options in most EDA
+/// tools. Smooth is the default: arcs avoid current crowding at the turns,
+/// which matters on a trace that is deliberately run hot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CornerStyle {
+    /// Square 90° turnarounds.
+    Rectangular,
+    /// 45° chamfered turnarounds.
+    Mitered,
+    /// Semicircular arc turnarounds (true arcs in the Gerber/KiCad output).
+    #[default]
+    Smooth,
+}
+
+impl CornerStyle {
+    pub const ALL: [CornerStyle; 3] = [
+        CornerStyle::Smooth,
+        CornerStyle::Mitered,
+        CornerStyle::Rectangular,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            CornerStyle::Rectangular => "Rectangular",
+            CornerStyle::Mitered => "Mitered (45°)",
+            CornerStyle::Smooth => "Smooth (arcs)",
+        }
+    }
+}
+
+fn default_pad_diameter() -> f64 {
+    2.5
 }
 
 impl Default for DesignRequest {
@@ -100,6 +140,8 @@ impl Default for DesignRequest {
             min_trace_mm: 0.15,
             min_gap_mm: 0.15,
             edge_margin_mm: 0.5,
+            pad_diameter_mm: default_pad_diameter(),
+            corner_style: CornerStyle::default(),
         }
     }
 }

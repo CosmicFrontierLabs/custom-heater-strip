@@ -46,12 +46,93 @@ impl Point {
     }
 }
 
+/// One piece of the routed trace centerline. Coordinates are board mm,
+/// y-down; `ccw` is the sweep direction in that y-down frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PathSeg {
+    Line {
+        a: Point,
+        b: Point,
+    },
+    Arc {
+        a: Point,
+        b: Point,
+        center: Point,
+        ccw: bool,
+    },
+}
+
+impl PathSeg {
+    pub fn start(&self) -> Point {
+        match self {
+            PathSeg::Line { a, .. } | PathSeg::Arc { a, .. } => *a,
+        }
+    }
+
+    pub fn end(&self) -> Point {
+        match self {
+            PathSeg::Line { b, .. } | PathSeg::Arc { b, .. } => *b,
+        }
+    }
+
+    /// Radius of an arc segment (0 for lines).
+    pub fn radius(&self) -> f64 {
+        match self {
+            PathSeg::Line { .. } => 0.0,
+            PathSeg::Arc { a, center, .. } => center.dist(a),
+        }
+    }
+
+    /// Sweep angle in radians, positive, measured along the travel direction.
+    pub fn sweep(&self) -> f64 {
+        match self {
+            PathSeg::Line { .. } => 0.0,
+            PathSeg::Arc { a, b, center, ccw } => {
+                let a0 = (a.y - center.y).atan2(a.x - center.x);
+                let a1 = (b.y - center.y).atan2(b.x - center.x);
+                let mut sweep = if *ccw { a1 - a0 } else { a0 - a1 };
+                while sweep <= 0.0 {
+                    sweep += std::f64::consts::TAU;
+                }
+                sweep
+            }
+        }
+    }
+
+    pub fn length(&self) -> f64 {
+        match self {
+            PathSeg::Line { a, b } => a.dist(b),
+            PathSeg::Arc { .. } => self.radius() * self.sweep(),
+        }
+    }
+
+    /// A point on the arc midway along the sweep (used for KiCad's
+    /// start/mid/end arc encoding).
+    pub fn arc_midpoint(&self) -> Option<Point> {
+        match self {
+            PathSeg::Line { .. } => None,
+            PathSeg::Arc { a, center, ccw, .. } => {
+                let r = self.radius();
+                let a0 = (a.y - center.y).atan2(a.x - center.x);
+                let half = self.sweep() / 2.0;
+                let mid = if *ccw { a0 + half } else { a0 - half };
+                Some(Point::new(
+                    center.x + r * mid.cos(),
+                    center.y + r * mid.sin(),
+                ))
+            }
+        }
+    }
+}
+
 /// Everything computed for one design: geometry + electrical numbers.
 pub struct Design {
     pub outline: Polygon,
     /// The serpentine centerline, in mm.
-    pub trace: Vec<Point>,
+    pub trace: Vec<PathSeg>,
     pub trace_width_mm: f64,
+    /// Solder terminal pad diameter, in mm.
+    pub pad_diameter_mm: f64,
     /// Silkscreen legend strokes (voltage/resistance/power/stackup notes).
     pub silk: silk::Silk,
     pub report: DesignReport,
@@ -86,6 +167,7 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
         &outline,
         solved.pitch_mm,
         req.edge_margin_mm + solved.width_mm / 2.0,
+        req.corner_style,
         &mut warnings,
     )?;
 
@@ -110,10 +192,21 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
     let silk = silk::generate(&outline, req, &report, &mut silk_warnings);
     report.warnings.extend(silk_warnings);
 
+    let mut pad_diameter_mm = req.pad_diameter_mm;
+    let pad_floor = refined.width_mm * 1.5;
+    if pad_diameter_mm < pad_floor {
+        report.warnings.push(format!(
+            "solder pad diameter raised from {pad_diameter_mm:.2} mm to \
+             {pad_floor:.2} mm (1.5× trace width) so the pad stays solderable"
+        ));
+        pad_diameter_mm = pad_floor;
+    }
+
     Ok(Design {
         outline,
         trace: serp.path,
         trace_width_mm: refined.width_mm,
+        pad_diameter_mm,
         silk,
         report,
     })
@@ -135,6 +228,7 @@ mod tests {
             min_trace_mm: 0.15,
             min_gap_mm: 0.15,
             edge_margin_mm: 0.5,
+            ..DesignRequest::default()
         }
     }
 

@@ -73,6 +73,15 @@ fn designer() -> Html {
     let min_trace = use_state(|| 0.15);
     let min_gap = use_state(|| 0.15);
     let edge_margin = use_state(|| 0.5);
+    let pad_diameter = use_state(|| 2.5);
+    let corner_style = use_state(shared::CornerStyle::default);
+    // Fab process floor for the trace-width slider; set by the preset picker.
+    let fab_floor = use_state(|| 0.05_f64);
+    // Outline source: uploaded SVG or a parametric rectangle.
+    let rect_mode = use_state(|| false);
+    let rect_w = use_state(|| 100.0_f64);
+    let rect_h = use_state(|| 20.0_f64);
+    let rect_r = use_state(|| 2.0_f64);
     let result = use_state(|| None::<DesignResponse>);
     let error = use_state(|| None::<String>);
     let busy = use_state(|| false);
@@ -106,13 +115,31 @@ fn designer() -> Html {
             min_gap.clone(),
             edge_margin.clone(),
         );
+        let (pad_diameter, corner_style) = (pad_diameter.clone(), corner_style.clone());
+        let (rect_mode, rect_w, rect_h, rect_r) = (
+            rect_mode.clone(),
+            rect_w.clone(),
+            rect_h.clone(),
+            rect_r.clone(),
+        );
         let result = result.clone();
         let error = error.clone();
         let busy = busy.clone();
         Callback::from(move |_: MouseEvent| {
-            let Some((_, svg)) = (*svg_text).clone() else {
-                error.set(Some("Upload an SVG outline first.".into()));
-                return;
+            let svg = if *rect_mode {
+                let (w, h) = (*rect_w, *rect_h);
+                let r = (*rect_r).clamp(0.0, w.min(h) / 2.0);
+                format!(
+                    r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}" rx="{r}"/></svg>"##
+                )
+            } else {
+                match (*svg_text).clone() {
+                    Some((_, svg)) => svg,
+                    None => {
+                        error.set(Some("Upload an SVG outline first.".into()));
+                        return;
+                    }
+                }
             };
             let req = DesignRequest {
                 svg,
@@ -123,6 +150,8 @@ fn designer() -> Html {
                 min_trace_mm: *min_trace,
                 min_gap_mm: *min_gap,
                 edge_margin_mm: *edge_margin,
+                pad_diameter_mm: *pad_diameter,
+                corner_style: *corner_style,
             };
             let result = result.clone();
             let error = error.clone();
@@ -158,8 +187,12 @@ fn designer() -> Html {
     };
 
     let on_preset = {
-        let (copper_oz, min_trace, min_gap) =
-            (copper_oz.clone(), min_trace.clone(), min_gap.clone());
+        let (copper_oz, min_trace, min_gap, fab_floor) = (
+            copper_oz.clone(),
+            min_trace.clone(),
+            min_gap.clone(),
+            fab_floor.clone(),
+        );
         Callback::from(move |e: Event| {
             let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
             if let Some(p) = shared::FAB_PRESETS
@@ -169,8 +202,39 @@ fn designer() -> Html {
                 copper_oz.set(p.copper_oz);
                 min_trace.set(p.min_trace_mm);
                 min_gap.set(p.min_gap_mm);
+                fab_floor.set(p.min_trace_mm);
+            } else {
+                fab_floor.set(0.05);
             }
         })
+    };
+
+    let on_trace_slider = {
+        let (min_trace, fab_floor) = (min_trace.clone(), fab_floor.clone());
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            if let Ok(v) = input.value().parse::<f64>() {
+                min_trace.set(v.max(*fab_floor));
+            }
+        })
+    };
+
+    let on_corner = {
+        let corner_style = corner_style.clone();
+        Callback::from(move |e: Event| {
+            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
+            if let Some(c) = shared::CornerStyle::ALL
+                .iter()
+                .find(|c| c.label() == select.value())
+            {
+                corner_style.set(*c);
+            }
+        })
+    };
+
+    let set_rect_mode = |to: bool| {
+        let rect_mode = rect_mode.clone();
+        Callback::from(move |_: Event| rect_mode.set(to))
     };
 
     html! {
@@ -180,13 +244,38 @@ fn designer() -> Html {
 
             <div class="panel">
                 <h2>{ "1 · Outline" }</h2>
-                <input type="file" accept=".svg,image/svg+xml" onchange={on_file} />
-                { match (*svg_text).as_ref() {
-                    Some((name, text)) => html! {
-                        <span class="file-ok">{ format!("{name} ({} bytes)", text.len()) }</span>
-                    },
-                    None => html! { <span class="file-hint">{ "SVG with a closed path, sized in mm" }</span> },
-                }}
+                <div class="mode-row">
+                    <label>
+                        <input type="radio" name="outline-mode" checked={!*rect_mode}
+                               onchange={set_rect_mode(false)} />
+                        { " Upload SVG" }
+                    </label>
+                    <label>
+                        <input type="radio" name="outline-mode" checked={*rect_mode}
+                               onchange={set_rect_mode(true)} />
+                        { " Rectangle" }
+                    </label>
+                </div>
+                { if *rect_mode { html! {
+                    <div class="fields">
+                        <NumField label="Width" unit="mm" value={*rect_w} step={1.0}
+                            onchange={let v = rect_w.clone(); Callback::from(move |x| v.set(x))} />
+                        <NumField label="Height" unit="mm" value={*rect_h} step={1.0}
+                            onchange={let v = rect_h.clone(); Callback::from(move |x| v.set(x))} />
+                        <NumField label="Corner radius" unit="mm" value={*rect_r} step={0.5}
+                            onchange={let v = rect_r.clone(); Callback::from(move |x| v.set(x))} />
+                    </div>
+                } } else { html! {
+                    <>
+                        <input type="file" accept=".svg,image/svg+xml" onchange={on_file} />
+                        { match (*svg_text).as_ref() {
+                            Some((name, text)) => html! {
+                                <span class="file-ok">{ format!("{name} ({} bytes)", text.len()) }</span>
+                            },
+                            None => html! { <span class="file-hint">{ "SVG with a closed path, sized in mm" }</span> },
+                        }}
+                    </>
+                } } }
             </div>
 
             <div class="panel">
@@ -212,13 +301,32 @@ fn designer() -> Html {
                 <div class="fields">
                     <NumField label="Copper weight" unit="oz" value={*copper_oz} step={0.5}
                         onchange={let v = copper_oz.clone(); Callback::from(move |x| v.set(x))} />
-                    <NumField label="Min trace" unit="mm" value={*min_trace} step={0.05}
-                        onchange={let v = min_trace.clone(); Callback::from(move |x| v.set(x))} />
                     <NumField label="Min gap" unit="mm" value={*min_gap} step={0.05}
                         onchange={let v = min_gap.clone(); Callback::from(move |x| v.set(x))} />
                     <NumField label="Edge margin" unit="mm" value={*edge_margin} step={0.1}
                         onchange={let v = edge_margin.clone(); Callback::from(move |x| v.set(x))} />
+                    <NumField label="Solder pad" unit="mm" value={*pad_diameter} step={0.5}
+                        onchange={let v = pad_diameter.clone(); Callback::from(move |x| v.set(x))} />
+                    <label class="field">
+                        <span class="field-label">{ "Corners" }</span>
+                        <select onchange={on_corner}>
+                            { for shared::CornerStyle::ALL.iter().map(|c| html! {
+                                <option selected={*c == *corner_style}>{ c.label() }</option>
+                            }) }
+                        </select>
+                    </label>
                 </div>
+                <label class="field slider-field">
+                    <span class="field-label">
+                        { format!("Min trace width: {:.2} mm (fab floor {:.2} mm)", *min_trace, *fab_floor) }
+                    </span>
+                    <input type="range"
+                           min={format!("{:.2}", *fab_floor)}
+                           max="1.00"
+                           step="0.01"
+                           value={format!("{}", *min_trace)}
+                           oninput={on_trace_slider} />
+                </label>
                 <button class="generate" onclick={on_generate} disabled={*busy}>
                     { if *busy { "Generating…" } else { "Generate heater" } }
                 </button>

@@ -226,6 +226,21 @@ mod tests {
     }
 
     #[test]
+    fn rect_element_with_rounded_corners_parses() {
+        // The frontend's "rectangle" outline mode emits a <rect rx=…>;
+        // usvg must normalize it to a path we can fill.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="60mm" height="12mm" viewBox="0 0 60 12"><rect width="60" height="12" rx="3"/></svg>"##;
+        let mut w = Vec::new();
+        let poly = parse_svg_outline(svg, &mut w).unwrap();
+        // Full rect is 720 mm²; r=3 corners shave 4r² − πr² ≈ 7.7 mm².
+        assert!(
+            (poly.area_mm2() - (720.0 - (4.0 - std::f64::consts::PI) * 9.0)).abs() < 1.0,
+            "{}",
+            poly.area_mm2()
+        );
+    }
+
+    #[test]
     fn unitless_svg_warns() {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><path d="M 0 0 L 100 0 L 100 20 L 0 20 Z"/></svg>"##;
         let mut w = Vec::new();

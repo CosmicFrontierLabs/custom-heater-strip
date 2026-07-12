@@ -137,6 +137,7 @@ mod tests {
             min_trace_mm: 0.15,
             min_gap_mm: 0.15,
             edge_margin_mm: 0.5,
+            ..DesignRequest::default()
         }
     }
 

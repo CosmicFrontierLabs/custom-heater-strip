@@ -1,11 +1,20 @@
 //! Boustrophedon serpentine fill: horizontal scanlines across the outline,
-//! connected end-to-end in alternating directions.
+//! connected end-to-end in alternating directions. Turnarounds are drawn in
+//! the requested corner style: square, 45° mitered, or semicircular arcs.
 
-use crate::{outline::Polygon, EngineError, Point};
+use shared::CornerStyle;
+
+use crate::{outline::Polygon, EngineError, PathSeg, Point};
 
 pub struct Serpentine {
-    pub path: Vec<Point>,
+    pub path: Vec<PathSeg>,
     pub length_mm: f64,
+}
+
+struct Row {
+    y: f64,
+    x0: f64,
+    x1: f64,
 }
 
 /// Fill `outline` with a serpentine of the given pitch, keeping `inset` mm of
@@ -14,6 +23,7 @@ pub fn fill(
     outline: &Polygon,
     pitch_mm: f64,
     inset_mm: f64,
+    style: CornerStyle,
     warnings: &mut Vec<String>,
 ) -> Result<Serpentine, EngineError> {
     let (min, max) = outline.bbox();
@@ -28,23 +38,22 @@ pub fn fill(
         )));
     }
 
-    let rows = (usable_height / pitch_mm).floor() as usize + 1;
-    if rows < 2 {
+    let rows_n = (usable_height / pitch_mm).floor() as usize + 1;
+    if rows_n < 2 {
         return Err(EngineError::OutlineTooSmall(format!(
-            "only {rows} serpentine row(s) fit; outline is too small for the \
+            "only {rows_n} serpentine row(s) fit; outline is too small for the \
              required {pitch_mm:.2} mm pitch"
         )));
     }
     // Center the rows vertically in the usable band.
-    let y_start = y_lo + (usable_height - (rows - 1) as f64 * pitch_mm) / 2.0;
+    let y_start = y_lo + (usable_height - (rows_n - 1) as f64 * pitch_mm) / 2.0;
 
-    let mut path: Vec<Point> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     let mut multi_span_rows = 0usize;
     let mut dropped_rows = 0usize;
-    let mut leftward = false;
 
-    for row in 0..rows {
-        let y = y_start + row as f64 * pitch_mm;
+    for i in 0..rows_n {
+        let y = y_start + i as f64 * pitch_mm;
         let hits = outline.scanline_hits(y);
         // Pair up even-odd crossings into inside spans, shrunk by the inset.
         let mut spans: Vec<(f64, f64)> = hits
@@ -61,11 +70,11 @@ pub fn fill(
             // Keep the widest span; concave regions to the side are skipped.
             spans.sort_by(|p, q| (q.1 - q.0).partial_cmp(&(p.1 - p.0)).unwrap());
         }
-        let (x0, x1) = spans[0];
-        let (start, end) = if leftward { (x1, x0) } else { (x0, x1) };
-        path.push(Point::new(start, y));
-        path.push(Point::new(end, y));
-        leftward = !leftward;
+        rows.push(Row {
+            y,
+            x0: spans[0].0,
+            x1: spans[0].1,
+        });
     }
 
     if multi_span_rows > 0 {
@@ -81,14 +90,103 @@ pub fn fill(
              route and were skipped"
         ));
     }
-
-    if path.len() < 4 {
+    if rows.len() < 2 {
         return Err(EngineError::OutlineTooSmall(
             "fewer than two serpentine rows could be routed".into(),
         ));
     }
 
-    let length_mm = path.windows(2).map(|w| w[0].dist(&w[1])).sum();
+    // Mitered/smooth turnarounds eat pitch/2 of row length at each turn.
+    // If any row is too narrow to give that up, fall back to square corners.
+    let mut style = style;
+    let turn_inset = match style {
+        CornerStyle::Rectangular => 0.0,
+        CornerStyle::Mitered | CornerStyle::Smooth => pitch_mm / 2.0,
+    };
+    if turn_inset > 0.0 && rows.iter().any(|r| r.x1 - r.x0 < 3.0 * turn_inset) {
+        warnings.push(format!(
+            "some rows are too narrow for {} turnarounds; using rectangular \
+             corners instead",
+            match style {
+                CornerStyle::Mitered => "mitered",
+                _ => "smooth",
+            }
+        ));
+        style = CornerStyle::Rectangular;
+    }
+    let turn_inset = match style {
+        CornerStyle::Rectangular => 0.0,
+        _ => pitch_mm / 2.0,
+    };
+
+    // Trim rows at each turn so the connector geometry stays inside the
+    // envelope, and record the turn's x line. Turn k joins rows k and k+1;
+    // even k turns on the right, odd on the left.
+    let n = rows.len();
+    let mut xl: Vec<f64> = rows.iter().map(|r| r.x0).collect();
+    let mut xr: Vec<f64> = rows.iter().map(|r| r.x1).collect();
+    let mut turn_x = vec![0.0f64; n - 1];
+    for k in 0..n - 1 {
+        if k % 2 == 0 {
+            let x = rows[k].x1.min(rows[k + 1].x1);
+            turn_x[k] = x;
+            xr[k] = x - turn_inset;
+            xr[k + 1] = x - turn_inset;
+        } else {
+            let x = rows[k].x0.max(rows[k + 1].x0);
+            turn_x[k] = x;
+            xl[k] = x + turn_inset;
+            xl[k + 1] = x + turn_inset;
+        }
+    }
+
+    let mut path: Vec<PathSeg> = Vec::new();
+    for k in 0..n {
+        let y = rows[k].y;
+        let (sx, ex) = if k % 2 == 0 {
+            (xl[k], xr[k])
+        } else {
+            (xr[k], xl[k])
+        };
+        path.push(PathSeg::Line {
+            a: Point::new(sx, y),
+            b: Point::new(ex, y),
+        });
+
+        if k + 1 == n {
+            break;
+        }
+        let y2 = rows[k + 1].y;
+        let ymid = (y + y2) / 2.0;
+        let right_turn = k % 2 == 0;
+        match style {
+            CornerStyle::Rectangular => path.push(PathSeg::Line {
+                a: Point::new(ex, y),
+                b: Point::new(ex, y2),
+            }),
+            CornerStyle::Mitered => {
+                let apex = Point::new(turn_x[k], ymid);
+                path.push(PathSeg::Line {
+                    a: Point::new(ex, y),
+                    b: apex,
+                });
+                path.push(PathSeg::Line {
+                    a: apex,
+                    b: Point::new(ex, y2),
+                });
+            }
+            CornerStyle::Smooth => path.push(PathSeg::Arc {
+                a: Point::new(ex, y),
+                b: Point::new(ex, y2),
+                center: Point::new(ex, ymid),
+                // Right turns bulge +x, which is a positive-angle sweep in
+                // the y-down board frame.
+                ccw: right_turn,
+            }),
+        }
+    }
+
+    let length_mm = path.iter().map(|s| s.length()).sum();
     Ok(Serpentine { path, length_mm })
 }
 
@@ -107,15 +205,22 @@ mod tests {
         }
     }
 
+    fn fill_style(style: CornerStyle) -> Serpentine {
+        fill(&rect(100.0, 20.0), 1.0, 0.6, style, &mut Vec::new()).unwrap()
+    }
+
     #[test]
     fn rect_fill_length_close_to_estimate() {
-        let poly = rect(100.0, 20.0);
-        let pitch = 1.0;
-        let inset = 0.6;
         let mut w = Vec::new();
-        let s = fill(&poly, pitch, inset, &mut w).unwrap();
-        // ~19 rows of ~98.8 mm each plus connectors.
-        let est = (20.0 - 2.0 * inset) / pitch * (100.0 - 2.0 * inset);
+        let s = fill(
+            &rect(100.0, 20.0),
+            1.0,
+            0.6,
+            CornerStyle::Rectangular,
+            &mut w,
+        )
+        .unwrap();
+        let est = (20.0 - 2.0 * 0.6) / 1.0 * (100.0 - 2.0 * 0.6);
         assert!(
             (s.length_mm - est).abs() / est < 0.15,
             "len {} vs est {}",
@@ -126,19 +231,74 @@ mod tests {
     }
 
     #[test]
-    fn path_stays_inside_rect() {
-        let poly = rect(50.0, 10.0);
-        let inset = 0.5;
-        let s = fill(&poly, 0.8, inset, &mut Vec::new()).unwrap();
-        for p in &s.path {
-            assert!(p.x >= inset - 1e-9 && p.x <= 50.0 - inset + 1e-9);
-            assert!(p.y >= inset - 1e-9 && p.y <= 10.0 - inset + 1e-9);
+    fn all_styles_stay_inside_envelope_and_connect() {
+        for style in CornerStyle::ALL {
+            let s = fill_style(style);
+            let mut prev_end: Option<Point> = None;
+            for seg in &s.path {
+                // Continuity: each segment starts where the last ended.
+                if let Some(pe) = prev_end {
+                    assert!(pe.dist(&seg.start()) < 1e-9, "gap in {style:?} path");
+                }
+                prev_end = Some(seg.end());
+                // Envelope: endpoints and arc bulges stay inside the inset.
+                for p in [seg.start(), seg.end()] {
+                    assert!(p.x >= 0.6 - 1e-9 && p.x <= 100.0 - 0.6 + 1e-9, "{style:?}");
+                    assert!(p.y >= 0.6 - 1e-9 && p.y <= 20.0 - 0.6 + 1e-9, "{style:?}");
+                }
+                if let PathSeg::Arc { center, .. } = seg {
+                    let bulge = center.x + seg.radius();
+                    let bulge_l = center.x - seg.radius();
+                    assert!(bulge <= 100.0 - 0.6 + 1e-9 && bulge_l >= 0.6 - 1e-9);
+                }
+            }
         }
     }
 
     #[test]
+    fn smooth_arcs_are_semicircles_with_pitch_radius() {
+        let s = fill_style(CornerStyle::Smooth);
+        let arcs: Vec<_> = s
+            .path
+            .iter()
+            .filter(|seg| matches!(seg, PathSeg::Arc { .. }))
+            .collect();
+        assert!(!arcs.is_empty());
+        for arc in arcs {
+            assert!((arc.radius() - 0.5).abs() < 1e-9, "r={}", arc.radius());
+            assert!((arc.sweep() - std::f64::consts::PI).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn smooth_is_shorter_than_rectangular() {
+        // Arc turnarounds trade π·r of arc for 2r of trimmed row on each
+        // side plus the 2r connector: net shorter path.
+        let rect_len = fill_style(CornerStyle::Rectangular).length_mm;
+        let smooth_len = fill_style(CornerStyle::Smooth).length_mm;
+        let miter_len = fill_style(CornerStyle::Mitered).length_mm;
+        assert!(smooth_len < rect_len);
+        assert!(miter_len < rect_len);
+    }
+
+    #[test]
+    fn narrow_outline_falls_back_to_rectangular() {
+        let mut w = Vec::new();
+        // 2 mm wide rows with 1.5 mm pitch: no room for 0.75 mm turn insets.
+        let s = fill(&rect(3.0, 20.0), 1.5, 0.4, CornerStyle::Smooth, &mut w).unwrap();
+        assert!(w.iter().any(|m| m.contains("rectangular")), "{w:?}");
+        assert!(s.path.iter().all(|seg| matches!(seg, PathSeg::Line { .. })));
+    }
+
+    #[test]
     fn tiny_outline_rejected() {
-        let poly = rect(2.0, 1.0);
-        assert!(fill(&poly, 1.0, 0.6, &mut Vec::new()).is_err());
+        assert!(fill(
+            &rect(2.0, 1.0),
+            1.0,
+            0.6,
+            CornerStyle::Rectangular,
+            &mut Vec::new()
+        )
+        .is_err());
     }
 }

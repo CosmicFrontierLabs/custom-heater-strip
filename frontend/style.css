@@ -80,3 +80,7 @@ h1 {
     padding: 0.35rem 0.5rem;
     margin-bottom: 0.75rem;
 }
+.mode-row { display: flex; gap: 1.5rem; margin-bottom: 0.75rem; }
+.mode-row label { cursor: pointer; }
+.slider-field { display: block; margin-top: 0.5rem; }
+.slider-field input[type="range"] { width: 100%; max-width: 24rem; accent-color: #e94560; }

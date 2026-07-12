@@ -32,7 +32,7 @@ pub fn render(design: &Design) -> String {
     let _ = write!(
         svg,
         r##"<path d="{}" fill="none" stroke="#d98f3d" stroke-width="{:.4}" stroke-linecap="round" stroke-linejoin="round"/>"##,
-        polyline_d(&design.trace, false),
+        trace_d(&design.trace),
         design.trace_width_mm
     );
 
@@ -46,10 +46,10 @@ pub fn render(design: &Design) -> String {
         );
     }
 
-    // Terminal markers at the two ends of the trace.
-    if let (Some(a), Some(b)) = (design.trace.first(), design.trace.last()) {
-        let r = (design.trace_width_mm * 1.2).max(0.8);
-        for p in [a, b] {
+    // Terminal pads at the two ends of the trace.
+    if let (Some(first), Some(last)) = (design.trace.first(), design.trace.last()) {
+        let r = design.pad_diameter_mm / 2.0;
+        for p in [first.start(), last.end()] {
             let _ = write!(
                 svg,
                 r##"<circle cx="{:.4}" cy="{:.4}" r="{r:.3}" fill="#e8c56b" stroke="#8c6d1f" stroke-width="0.15"/>"##,
@@ -60,6 +60,36 @@ pub fn render(design: &Design) -> String {
 
     svg.push_str("</svg>");
     svg
+}
+
+/// SVG `d` string for the routed trace: lines as `L`, arcs as `A` commands.
+fn trace_d(segs: &[crate::PathSeg]) -> String {
+    use crate::PathSeg;
+    let mut d = String::with_capacity(segs.len() * 24);
+    for (i, seg) in segs.iter().enumerate() {
+        if i == 0 {
+            let s = seg.start();
+            let _ = write!(d, "M{:.4} {:.4}", s.x, s.y);
+        }
+        match seg {
+            PathSeg::Line { b, .. } => {
+                let _ = write!(d, "L{:.4} {:.4}", b.x, b.y);
+            }
+            PathSeg::Arc { b, ccw, .. } => {
+                // SVG's sweep=1 is the positive-angle direction in its
+                // y-down frame, matching our `ccw` convention.
+                let _ = write!(
+                    d,
+                    "A{r:.4} {r:.4} 0 0 {sweep} {x:.4} {y:.4}",
+                    r = seg.radius(),
+                    sweep = if *ccw { 1 } else { 0 },
+                    x = b.x,
+                    y = b.y
+                );
+            }
+        }
+    }
+    d
 }
 
 fn polyline_d(pts: &[Point], close: bool) -> String {
@@ -92,12 +122,23 @@ mod tests {
                 ],
             },
             trace: vec![
-                Point::new(1.0, 1.0),
-                Point::new(9.0, 1.0),
-                Point::new(9.0, 4.0),
-                Point::new(1.0, 4.0),
+                crate::PathSeg::Line {
+                    a: Point::new(1.0, 1.0),
+                    b: Point::new(9.0, 1.0),
+                },
+                crate::PathSeg::Arc {
+                    a: Point::new(9.0, 1.0),
+                    b: Point::new(9.0, 4.0),
+                    center: Point::new(9.0, 2.5),
+                    ccw: true,
+                },
+                crate::PathSeg::Line {
+                    a: Point::new(9.0, 4.0),
+                    b: Point::new(1.0, 4.0),
+                },
             ],
             trace_width_mm: 0.4,
+            pad_diameter_mm: 2.5,
             silk: crate::silk::Silk {
                 strokes: vec![],
                 stroke_mm: 0.15,
@@ -121,5 +162,9 @@ mod tests {
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("stroke-width=\"0.4000\""));
         assert!(svg.matches("<circle").count() == 2);
+        // Arc turnaround renders as an SVG arc command with sweep=1.
+        assert!(svg.contains("A1.5000 1.5000 0 0 1 9.0000 4.0000"), "{svg}");
+        // Pad radius comes from the requested pad diameter.
+        assert!(svg.contains(r#"r="1.250""#));
     }
 }

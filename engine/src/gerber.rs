@@ -54,6 +54,35 @@ impl GerberFile {
         }
     }
 
+    /// Stroke a mixed line/arc path. Arcs use multi-quadrant (G75) circular
+    /// interpolation with I/J center offsets, returning to linear (G01)
+    /// afterwards.
+    fn path(&mut self, segs: &[crate::PathSeg]) {
+        for (i, seg) in segs.iter().enumerate() {
+            if i == 0 {
+                let (x, y) = xy(&seg.start());
+                let _ = writeln!(self.body, "X{x}Y{y}D02*");
+            }
+            match seg {
+                crate::PathSeg::Line { b, .. } => {
+                    let (x, y) = xy(b);
+                    let _ = writeln!(self.body, "X{x}Y{y}D01*");
+                }
+                crate::PathSeg::Arc { a, b, center, ccw } => {
+                    // The y-axis flip to Gerber's y-up frame reverses the
+                    // sweep handedness: board-ccw becomes G02 (clockwise).
+                    let g = if *ccw { "G02" } else { "G03" };
+                    let (x, y) = xy(b);
+                    let i_off = coord(center.x - a.x);
+                    let j_off = coord(-(center.y - a.y));
+                    let _ = writeln!(self.body, "G75*");
+                    let _ = writeln!(self.body, "{g}X{x}Y{y}I{i_off}J{j_off}D01*");
+                    let _ = writeln!(self.body, "G01*");
+                }
+            }
+        }
+    }
+
     fn flash(&mut self, p: &Point) {
         let (x, y) = xy(p);
         let _ = writeln!(self.body, "X{x}Y{y}D03*");
@@ -65,26 +94,20 @@ impl GerberFile {
     }
 }
 
-/// Terminal pad diameter: comfortably wider than the trace, never tiny.
-pub fn terminal_diameter_mm(trace_width_mm: f64) -> f64 {
-    (trace_width_mm * 2.5).max(2.0)
-}
-
 pub fn render(design: &Design) -> BTreeMap<String, String> {
     let mut files = BTreeMap::new();
-    let pad_d = terminal_diameter_mm(design.trace_width_mm);
-    let terminals: Vec<Point> = [design.trace.first(), design.trace.last()]
-        .into_iter()
-        .flatten()
-        .copied()
-        .collect();
+    let pad_d = design.pad_diameter_mm;
+    let terminals: Vec<Point> = match (design.trace.first(), design.trace.last()) {
+        (Some(first), Some(last)) => vec![first.start(), last.end()],
+        _ => Vec::new(),
+    };
 
     // Top copper: serpentine strokes + terminal pads.
     let mut cu = GerberFile::new("Copper,L1,Top", "Positive");
     cu.circle_aperture(10, design.trace_width_mm);
     cu.circle_aperture(11, pad_d);
     cu.select(10);
-    cu.polyline(&design.trace);
+    cu.path(&design.trace);
     cu.select(11);
     for t in &terminals {
         cu.flash(t);
@@ -151,5 +174,22 @@ mod tests {
         let cu = &files["heater-F_Cu.gtl"];
         assert_eq!(cu.matches("D03*").count(), 2, "expected 2 terminal flashes");
         assert!(cu.contains("D01*"), "no draw commands in copper layer");
+    }
+
+    #[test]
+    fn smooth_corners_emit_true_gerber_arcs() {
+        let req = DesignRequest {
+            svg: RECT_SVG.to_string(),
+            corner_style: shared::CornerStyle::Smooth,
+            ..DesignRequest::default()
+        };
+        let d = crate::design(&req).unwrap();
+        let cu = &super::render(&d)["heater-F_Cu.gtl"];
+        assert!(cu.contains("G75*"), "multi-quadrant mode not enabled");
+        // Board-frame CCW right turns become G02 after the y flip; a full
+        // serpentine turns both ways.
+        assert!(cu.contains("G02X"), "no clockwise arcs");
+        assert!(cu.contains("G03X"), "no counter-clockwise arcs");
+        assert!(cu.contains("J-"), "arc J offsets should be signed");
     }
 }
