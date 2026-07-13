@@ -89,6 +89,23 @@ client-side, so no SVG is needed for simple strips. For uploads:
   heater warms — power at temperature will be below the 20 °C figure)
 - Gerber output is not yet validated against a fab's CAM
 
+## Fill patterns
+
+Six patterns, all single continuous non-crossing paths at uniform pitch with
+both ends at the terminal zone (see docs/fill-patterns.md for the research):
+
+![fill pattern montage](docs/fill-patterns-montage.png)
+
+- **Serpentine** — the classic; **Wavy** — sinusoidal rows for flex-fatigue
+  life; **Counterflow** — bifilar out-and-back (non-inductive), built by
+  offsetting a double-pitch serpentine ±p/2
+- **Hilbert** — generalized (gilbert) space-filling curve, best thermal
+  isotropy; rectangles only
+- **Double spiral** — interleaved Archimedean arms, best for round boards
+  (fills the inscribed circle)
+- **Concentric** — outline insets (cavalier_contours) spliced through a
+  channel at the left; best coverage of irregular outlines
+
 ## Example
 
 100×20 mm strip, 12 V / 10 W / 2 A max, 0.5 oz copper →

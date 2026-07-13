@@ -5,11 +5,11 @@
 //! requested power, along with fab outputs: KiCad board, Gerbers, SVG preview,
 //! and a numeric design report.
 
+mod fills;
 mod gerber;
 mod kicad;
 mod outline;
 mod preview;
-mod serpentine;
 mod silk;
 mod solver;
 mod terminals;
@@ -177,7 +177,8 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
         &mut warnings,
     )?;
 
-    let serp = serpentine::fill(
+    let fill_path = fills::fill(
+        req.fill_kind,
         &outline,
         solved.pitch_mm,
         inset,
@@ -186,11 +187,11 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
         &mut warnings,
     )?;
 
-    // Full electrical path: pad A → feed → serpentine → feed → pad B.
-    let row_start = serp.path.first().expect("nonempty path").start();
-    let row_end = serp.path.last().expect("nonempty path").end();
+    // Full electrical path: pad A → feed → fill pattern → feed → pad B.
+    let row_start = fill_path.first().expect("nonempty path").start();
+    let row_end = fill_path.last().expect("nonempty path").end();
     let mut trace = plan.feed_start(row_start);
-    trace.extend(serp.path);
+    trace.extend(fill_path);
     trace.extend(plan.feed_end(row_end));
     let length_mm: f64 = trace.iter().map(|s| s.length()).sum();
 
@@ -275,6 +276,35 @@ mod tests {
         let mut req = rect_request();
         req.watts = 100.0; // 100 W @ 12 V → 8.3 A > 2 A ceiling
         assert!(matches!(design(&req), Err(EngineError::Infeasible(_))));
+    }
+
+    #[test]
+    fn every_fill_kind_designs_the_rect_strip() {
+        for kind in shared::FillKind::ALL {
+            let req = DesignRequest {
+                fill_kind: kind,
+                ..rect_request()
+            };
+            let d = design(&req).expect(kind.label());
+            // Continuous pad-to-pad path.
+            let mut prev: Option<Point> = None;
+            for seg in &d.trace {
+                if let Some(p) = prev {
+                    assert!(p.dist(&seg.start()) < 1e-6, "{kind:?} path gap");
+                }
+                prev = Some(seg.end());
+            }
+            // Resistance lands within 25% of target (width refinement may
+            // clamp for low-coverage patterns like the spiral).
+            let r = &d.report;
+            let err = (r.achieved_resistance_ohms - r.target_resistance_ohms).abs()
+                / r.target_resistance_ohms;
+            assert!(
+                err < 0.25 || !r.warnings.is_empty(),
+                "{kind:?}: R off by {:.0}% with no warning",
+                err * 100.0
+            );
+        }
     }
 
     #[test]

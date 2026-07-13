@@ -75,6 +75,7 @@ fn designer() -> Html {
     let edge_margin = use_state(|| 0.5);
     let pad_diameter = use_state(|| 2.5);
     let corner_style = use_state(shared::CornerStyle::default);
+    let fill_kind = use_state(shared::FillKind::default);
     // Fab process floor for the trace-width slider; set by the preset picker.
     let fab_floor = use_state(|| 0.05_f64);
     // Outline source: uploaded SVG or a parametric rectangle.
@@ -114,7 +115,11 @@ fn designer() -> Html {
             min_gap.clone(),
             edge_margin.clone(),
         );
-        let (pad_diameter, corner_style) = (pad_diameter.clone(), corner_style.clone());
+        let (pad_diameter, corner_style, fill_kind) = (
+            pad_diameter.clone(),
+            corner_style.clone(),
+            fill_kind.clone(),
+        );
         let (rect_mode, rect_w, rect_h) = (rect_mode.clone(), rect_w.clone(), rect_h.clone());
         let result = result.clone();
         let error = error.clone();
@@ -145,6 +150,7 @@ fn designer() -> Html {
                 edge_margin_mm: *edge_margin,
                 pad_diameter_mm: *pad_diameter,
                 corner_style: *corner_style,
+                fill_kind: *fill_kind,
             };
             let result = result.clone();
             let error = error.clone();
@@ -208,6 +214,19 @@ fn designer() -> Html {
             let input: HtmlInputElement = e.target_unchecked_into();
             if let Ok(v) = input.value().parse::<f64>() {
                 min_trace.set(v.max(*fab_floor));
+            }
+        })
+    };
+
+    let on_fill_kind = {
+        let fill_kind = fill_kind.clone();
+        Callback::from(move |e: Event| {
+            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
+            if let Some(k) = shared::FillKind::ALL
+                .iter()
+                .find(|k| k.label() == select.value())
+            {
+                fill_kind.set(*k);
             }
         })
     };
@@ -298,6 +317,14 @@ fn designer() -> Html {
                         onchange={let v = edge_margin.clone(); Callback::from(move |x| v.set(x))} />
                     <NumField label="Solder pad" unit="mm" value={*pad_diameter} step={0.5}
                         onchange={let v = pad_diameter.clone(); Callback::from(move |x| v.set(x))} />
+                    <label class="field">
+                        <span class="field-label">{ "Fill pattern" }</span>
+                        <select onchange={on_fill_kind}>
+                            { for shared::FillKind::ALL.iter().map(|k| html! {
+                                <option selected={*k == *fill_kind}>{ k.label() }</option>
+                            }) }
+                        </select>
+                    </label>
                     <label class="field">
                         <span class="field-label">{ "Corners" }</span>
                         <select onchange={on_corner}>

@@ -93,6 +93,56 @@ pub struct DesignRequest {
     /// How serpentine turnarounds are drawn.
     #[serde(default)]
     pub corner_style: CornerStyle,
+    /// Which fill pattern routes the heater trace.
+    #[serde(default)]
+    pub fill_kind: FillKind,
+}
+
+/// Trace fill pattern. All patterns produce one continuous non-crossing
+/// path at uniform pitch with both ends at the terminal zone; see
+/// docs/fill-patterns.md for the research behind the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FillKind {
+    /// Boustrophedon rows — the classic strip heater.
+    #[default]
+    Serpentine,
+    /// Serpentine with sinusoidal rows: same electrical behavior, much
+    /// better flex-fatigue life.
+    WavySerpentine,
+    /// Out-and-back interleaved serpentine (bifilar): non-inductive,
+    /// current counterflows everywhere.
+    Counterflow,
+    /// Generalized Hilbert space-filling curve: best thermal isotropy.
+    /// Rectangular outlines only.
+    Hilbert,
+    /// Two interleaved Archimedean spiral arms joined at the center.
+    /// Fills the inscribed circle; best for round outlines.
+    DoubleSpiral,
+    /// Concentric outline insets spliced into one path: best coverage of
+    /// irregular outlines.
+    Concentric,
+}
+
+impl FillKind {
+    pub const ALL: [FillKind; 6] = [
+        FillKind::Serpentine,
+        FillKind::WavySerpentine,
+        FillKind::Counterflow,
+        FillKind::Hilbert,
+        FillKind::DoubleSpiral,
+        FillKind::Concentric,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            FillKind::Serpentine => "Serpentine",
+            FillKind::WavySerpentine => "Wavy serpentine",
+            FillKind::Counterflow => "Counterflow (bifilar)",
+            FillKind::Hilbert => "Hilbert curve",
+            FillKind::DoubleSpiral => "Double spiral",
+            FillKind::Concentric => "Concentric",
+        }
+    }
 }
 
 /// Serpentine turnaround geometry, matching the corner options in most EDA
@@ -142,6 +192,7 @@ impl Default for DesignRequest {
             edge_margin_mm: 0.5,
             pad_diameter_mm: default_pad_diameter(),
             corner_style: CornerStyle::default(),
+            fill_kind: FillKind::default(),
         }
     }
 }
