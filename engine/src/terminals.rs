@@ -73,7 +73,9 @@ pub fn layout(
     let pad_w = 1.6 * s;
     let pad_h = s;
     let pad_gap = (2.0 * gap_mm).max(0.8);
-    let clearance = (2.0 * gap_mm).max(0.5);
+    // Keepout around the pads: two routing pitches (so even a turn arc plus
+    // its trace body clears comfortably), never under 1.2 mm.
+    let clearance = (2.0 * (trace_width_mm + gap_mm)).max(1.2);
 
     let lane = (2.0 * (trace_width_mm + gap_mm)).max(1.2);
     let pocket_w = 2.0 * lane + pad_w;
