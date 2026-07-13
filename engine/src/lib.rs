@@ -285,7 +285,7 @@ mod tests {
                 fill_kind: kind,
                 ..rect_request()
             };
-            let d = design(&req).expect(kind.label());
+            let d = design(&req).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
             // Continuous pad-to-pad path.
             let mut prev: Option<Point> = None;
             for seg in &d.trace {
