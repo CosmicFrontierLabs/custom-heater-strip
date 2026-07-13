@@ -221,6 +221,9 @@ pub struct DesignResponse {
     pub kicad_pcb: String,
     /// Gerber layers keyed by filename (e.g. "heater-F_Cu.gtl").
     pub gerbers: std::collections::BTreeMap<String, String>,
+    /// The same gerber set as a base64-encoded .zip, ready to download.
+    #[serde(default)]
+    pub gerber_zip_base64: String,
 }
 
 /// Error response for a failed design request.

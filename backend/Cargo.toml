@@ -36,6 +36,8 @@ ws-bridge = { version = "0.1", features = ["server"] }
 
 # Utilities
 anyhow = "1"
+base64 = "0.22"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 

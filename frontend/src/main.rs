@@ -81,7 +81,6 @@ fn designer() -> Html {
     let rect_mode = use_state(|| false);
     let rect_w = use_state(|| 100.0_f64);
     let rect_h = use_state(|| 20.0_f64);
-    let rect_r = use_state(|| 2.0_f64);
     let result = use_state(|| None::<DesignResponse>);
     let error = use_state(|| None::<String>);
     let busy = use_state(|| false);
@@ -116,21 +115,15 @@ fn designer() -> Html {
             edge_margin.clone(),
         );
         let (pad_diameter, corner_style) = (pad_diameter.clone(), corner_style.clone());
-        let (rect_mode, rect_w, rect_h, rect_r) = (
-            rect_mode.clone(),
-            rect_w.clone(),
-            rect_h.clone(),
-            rect_r.clone(),
-        );
+        let (rect_mode, rect_w, rect_h) = (rect_mode.clone(), rect_w.clone(), rect_h.clone());
         let result = result.clone();
         let error = error.clone();
         let busy = busy.clone();
         Callback::from(move |_: MouseEvent| {
             let svg = if *rect_mode {
                 let (w, h) = (*rect_w, *rect_h);
-                let r = (*rect_r).clamp(0.0, w.min(h) / 2.0);
                 format!(
-                    r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}" rx="{r}"/></svg>"##
+                    r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}"/></svg>"##
                 )
             } else {
                 match (*svg_text).clone() {
@@ -262,8 +255,6 @@ fn designer() -> Html {
                             onchange={let v = rect_w.clone(); Callback::from(move |x| v.set(x))} />
                         <NumField label="Height" unit="mm" value={*rect_h} step={1.0}
                             onchange={let v = rect_h.clone(); Callback::from(move |x| v.set(x))} />
-                        <NumField label="Corner radius" unit="mm" value={*rect_r} step={0.5}
-                            onchange={let v = rect_r.clone(); Callback::from(move |x| v.set(x))} />
                     </div>
                 } } else { html! {
                     <>
@@ -347,13 +338,18 @@ fn render_result(resp: &DesignResponse) -> Html {
     let r = &resp.report;
     let preview = Html::from_html_unchecked(AttrValue::from(resp.preview_svg.clone()));
 
-    let mut downloads: Vec<(String, String)> =
-        vec![("heater.kicad_pcb".to_string(), data_url(&resp.kicad_pcb))];
-    downloads.extend(
-        resp.gerbers
-            .iter()
-            .map(|(name, body)| (name.clone(), data_url(body))),
-    );
+    let downloads: Vec<(String, String, String)> = vec![
+        (
+            "heater.kicad_pcb".to_string(),
+            "KiCad board".to_string(),
+            data_url(&resp.kicad_pcb),
+        ),
+        (
+            "heater-gerbers.zip".to_string(),
+            format!("Gerber set, {} layers", resp.gerbers.len()),
+            format!("data:application/zip;base64,{}", resp.gerber_zip_base64),
+        ),
+    ];
 
     html! {
         <>
@@ -384,8 +380,11 @@ fn render_result(resp: &DesignResponse) -> Html {
         <div class="panel">
             <h2>{ "Downloads" }</h2>
             <ul class="downloads">
-                { for downloads.iter().map(|(name, url)| html! {
-                    <li><a href={url.clone()} download={name.clone()}>{ name }</a></li>
+                { for downloads.iter().map(|(filename, label, url)| html! {
+                    <li>
+                        <a href={url.clone()} download={filename.clone()}>{ filename }</a>
+                        <span class="dl-label">{ format!(" — {label}") }</span>
+                    </li>
                 }) }
             </ul>
         </div>

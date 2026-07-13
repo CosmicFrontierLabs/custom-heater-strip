@@ -84,3 +84,4 @@ h1 {
 .mode-row label { cursor: pointer; }
 .slider-field { display: block; margin-top: 0.5rem; }
 .slider-field input[type="range"] { width: 100%; max-width: 24rem; accent-color: #e94560; }
+.dl-label { color: #9aa0b8; font-size: 0.85rem; }

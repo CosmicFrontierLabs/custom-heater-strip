@@ -145,6 +145,8 @@ pub fn generate(req: &DesignRequest) -> Result<DesignResponse, EngineError> {
         preview_svg: preview::render(&design),
         kicad_pcb: kicad::render(&design),
         gerbers: gerber::render(&design),
+        // Filled in by the server, which owns archive packaging.
+        gerber_zip_base64: String::new(),
         report: design.report,
     })
 }
