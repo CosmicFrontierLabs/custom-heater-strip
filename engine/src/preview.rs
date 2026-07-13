@@ -46,16 +46,16 @@ pub fn render(design: &Design) -> String {
         );
     }
 
-    // Terminal pads at the two ends of the trace.
-    if let (Some(first), Some(last)) = (design.trace.first(), design.trace.last()) {
-        let r = design.pad_diameter_mm / 2.0;
-        for p in [first.start(), last.end()] {
-            let _ = write!(
-                svg,
-                r##"<circle cx="{:.4}" cy="{:.4}" r="{r:.3}" fill="#e8c56b" stroke="#8c6d1f" stroke-width="0.15"/>"##,
-                p.x, p.y
-            );
-        }
+    // Rectangular terminal pads.
+    for p in &design.pads {
+        let _ = write!(
+            svg,
+            r##"<rect x="{:.4}" y="{:.4}" width="{:.4}" height="{:.4}" fill="#e8c56b" stroke="#8c6d1f" stroke-width="0.15"/>"##,
+            p.cx - p.w / 2.0,
+            p.cy - p.h / 2.0,
+            p.w,
+            p.h
+        );
     }
 
     svg.push_str("</svg>");
@@ -138,7 +138,20 @@ mod tests {
                 },
             ],
             trace_width_mm: 0.4,
-            pad_diameter_mm: 2.5,
+            pads: [
+                crate::PadRect {
+                    cx: 1.0,
+                    cy: 1.0,
+                    w: 2.0,
+                    h: 1.25,
+                },
+                crate::PadRect {
+                    cx: 1.0,
+                    cy: 4.0,
+                    w: 2.0,
+                    h: 1.25,
+                },
+            ],
             silk: crate::silk::Silk {
                 strokes: vec![],
                 stroke_mm: 0.15,
@@ -161,10 +174,10 @@ mod tests {
         let svg = render(&design);
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("stroke-width=\"0.4000\""));
-        assert!(svg.matches("<circle").count() == 2);
+        assert_eq!(svg.matches("<rect").count(), 2, "two rectangular pads");
         // Arc turnaround renders as an SVG arc command with sweep=1.
         assert!(svg.contains("A1.5000 1.5000 0 0 1 9.0000 4.0000"), "{svg}");
-        // Pad radius comes from the requested pad diameter.
-        assert!(svg.contains(r#"r="1.250""#));
+        // Pad rect derives from center and size.
+        assert!(svg.contains(r#"<rect x="0.0000" y="0.3750" width="2.0000" height="1.2500""#));
     }
 }

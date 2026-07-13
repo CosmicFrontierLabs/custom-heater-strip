@@ -12,10 +12,12 @@ mod preview;
 mod serpentine;
 mod silk;
 mod solver;
+mod terminals;
 
 use shared::{DesignReport, DesignRequest, DesignResponse};
 
 pub use outline::Polygon;
+pub use terminals::PadRect;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -128,11 +130,11 @@ impl PathSeg {
 /// Everything computed for one design: geometry + electrical numbers.
 pub struct Design {
     pub outline: Polygon,
-    /// The serpentine centerline, in mm.
+    /// The full trace centerline (pad to pad), in mm.
     pub trace: Vec<PathSeg>,
     pub trace_width_mm: f64,
-    /// Solder terminal pad diameter, in mm.
-    pub pad_diameter_mm: f64,
+    /// The two rectangular solder pads, symmetric about the centerline.
+    pub pads: [PadRect; 2],
     /// Silkscreen legend strokes (voltage/resistance/power/stackup notes).
     pub silk: silk::Silk,
     pub report: DesignReport,
@@ -164,16 +166,35 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
     }
 
     let solved = solver::solve(req, area_mm2)?;
+    let inset = req.edge_margin_mm + solved.width_mm / 2.0;
+
+    let plan = terminals::layout(
+        outline.bbox(),
+        inset,
+        solved.width_mm,
+        req.min_gap_mm,
+        req.pad_diameter_mm,
+        &mut warnings,
+    )?;
 
     let serp = serpentine::fill(
         &outline,
         solved.pitch_mm,
-        req.edge_margin_mm + solved.width_mm / 2.0,
+        inset,
+        plan.zone_width_mm,
         req.corner_style,
         &mut warnings,
     )?;
 
-    let refined = solver::refine(req, &solved, serp.length_mm, &mut warnings);
+    // Full electrical path: pad A → feed → serpentine → feed → pad B.
+    let row_start = serp.path.first().expect("nonempty path").start();
+    let row_end = serp.path.last().expect("nonempty path").end();
+    let mut trace = plan.feed_start(row_start);
+    trace.extend(serp.path);
+    trace.extend(plan.feed_end(row_end));
+    let length_mm: f64 = trace.iter().map(|s| s.length()).sum();
+
+    let refined = solver::refine(req, &solved, length_mm, &mut warnings);
 
     let mut report = DesignReport {
         target_resistance_ohms: refined.target_resistance_ohms,
@@ -183,7 +204,7 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
         current_headroom_frac: refined.operating_current_amps / req.max_current,
         trace_width_mm: refined.width_mm,
         trace_gap_mm: solved.pitch_mm - refined.width_mm,
-        trace_length_mm: serp.length_mm,
+        trace_length_mm: length_mm,
         outline_area_cm2: area_mm2 / 100.0,
         power_density_w_cm2: refined.achieved_watts / (area_mm2 / 100.0),
         copper_thickness_um: solved.thickness_m * 1e6,
@@ -191,24 +212,20 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
     };
 
     let mut silk_warnings = Vec::new();
-    let silk = silk::generate(&outline, req, &report, &mut silk_warnings);
+    let silk = silk::generate(
+        &outline,
+        plan.zone_width_mm,
+        req,
+        &report,
+        &mut silk_warnings,
+    );
     report.warnings.extend(silk_warnings);
-
-    let mut pad_diameter_mm = req.pad_diameter_mm;
-    let pad_floor = refined.width_mm * 1.5;
-    if pad_diameter_mm < pad_floor {
-        report.warnings.push(format!(
-            "solder pad diameter raised from {pad_diameter_mm:.2} mm to \
-             {pad_floor:.2} mm (1.5× trace width) so the pad stays solderable"
-        ));
-        pad_diameter_mm = pad_floor;
-    }
 
     Ok(Design {
         outline,
-        trace: serp.path,
+        trace,
         trace_width_mm: refined.width_mm,
-        pad_diameter_mm,
+        pads: plan.pads,
         silk,
         report,
     })

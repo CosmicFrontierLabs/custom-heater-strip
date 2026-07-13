@@ -25,6 +25,7 @@ const LINE_SPACING: f64 = 1.45;
 
 pub fn generate(
     outline: &Polygon,
+    left_reserved_mm: f64,
     req: &DesignRequest,
     report: &DesignReport,
     warnings: &mut Vec<String>,
@@ -41,7 +42,10 @@ pub fn generate(
     ];
 
     let (min, max) = outline.bbox();
-    let avail_w = max.x - min.x - 2.0;
+    // Keep the legend clear of the terminal zone at the left edge — silk
+    // over mask-opened pads is a fab violation.
+    let left = min.x + left_reserved_mm;
+    let avail_w = max.x - left - 2.0;
     let avail_h = max.y - min.y - 2.0;
     let longest = lines.iter().map(|l| l.len()).max().unwrap() as f64;
 
@@ -62,7 +66,7 @@ pub fn generate(
     }
 
     let stroke_mm = (0.12 * char_h).max(0.15);
-    let cx = (min.x + max.x) / 2.0;
+    let cx = (left + max.x) / 2.0;
     let block_h = lines.len() as f64 * char_h * LINE_SPACING - char_h * (LINE_SPACING - 1.0);
     let mut y = (min.y + max.y) / 2.0 - block_h / 2.0;
 
@@ -215,7 +219,13 @@ mod tests {
     fn legend_fits_inside_outline() {
         let outline = rect(100.0, 20.0);
         let mut w = Vec::new();
-        let silk = generate(&outline, &DesignRequest::default(), &dummy_report(), &mut w);
+        let silk = generate(
+            &outline,
+            0.0,
+            &DesignRequest::default(),
+            &dummy_report(),
+            &mut w,
+        );
         assert!(w.is_empty(), "{w:?}");
         assert!(!silk.strokes.is_empty());
         for stroke in &silk.strokes {
@@ -230,7 +240,13 @@ mod tests {
     fn tiny_outline_skips_silk_with_warning() {
         let outline = rect(10.0, 5.0);
         let mut w = Vec::new();
-        let silk = generate(&outline, &DesignRequest::default(), &dummy_report(), &mut w);
+        let silk = generate(
+            &outline,
+            0.0,
+            &DesignRequest::default(),
+            &dummy_report(),
+            &mut w,
+        );
         assert!(silk.strokes.is_empty());
         assert_eq!(w.len(), 1);
     }

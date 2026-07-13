@@ -19,10 +19,15 @@ struct Row {
 
 /// Fill `outline` with a serpentine of the given pitch, keeping `inset` mm of
 /// clearance from the boundary (edge margin + half trace width).
+///
+/// `left_reserved_mm` keeps a strip at the left edge free for the terminal
+/// zone; when nonzero the row count is forced even so the path starts *and*
+/// ends at the left, next to the pads.
 pub fn fill(
     outline: &Polygon,
     pitch_mm: f64,
     inset_mm: f64,
+    left_reserved_mm: f64,
     style: CornerStyle,
     warnings: &mut Vec<String>,
 ) -> Result<Serpentine, EngineError> {
@@ -38,7 +43,10 @@ pub fn fill(
         )));
     }
 
-    let rows_n = (usable_height / pitch_mm).floor() as usize + 1;
+    let mut rows_n = (usable_height / pitch_mm).floor() as usize + 1;
+    if left_reserved_mm > 0.0 && rows_n % 2 == 1 {
+        rows_n -= 1;
+    }
     if rows_n < 2 {
         return Err(EngineError::OutlineTooSmall(format!(
             "only {rows_n} serpentine row(s) fit; outline is too small for the \
@@ -55,10 +63,12 @@ pub fn fill(
     for i in 0..rows_n {
         let y = y_start + i as f64 * pitch_mm;
         let hits = outline.scanline_hits(y);
-        // Pair up even-odd crossings into inside spans, shrunk by the inset.
+        // Pair up even-odd crossings into inside spans, shrunk by the inset
+        // and pushed right of the reserved terminal zone.
+        let zone_edge = min.x + inset_mm + left_reserved_mm;
         let mut spans: Vec<(f64, f64)> = hits
             .chunks_exact(2)
-            .map(|c| (c[0] + inset_mm, c[1] - inset_mm))
+            .map(|c| ((c[0] + inset_mm).max(zone_edge), c[1] - inset_mm))
             .filter(|(a, b)| b > a)
             .collect();
         if spans.is_empty() {
@@ -89,6 +99,11 @@ pub fn fill(
             "{dropped_rows} row(s) near the outline edge were too narrow to \
              route and were skipped"
         ));
+    }
+    // Span drops can re-odd the count; the terminal zone needs the path to
+    // end back at the left edge.
+    if left_reserved_mm > 0.0 && rows.len() % 2 == 1 {
+        rows.pop();
     }
     if rows.len() < 2 {
         return Err(EngineError::OutlineTooSmall(
@@ -206,7 +221,7 @@ mod tests {
     }
 
     fn fill_style(style: CornerStyle) -> Serpentine {
-        fill(&rect(100.0, 20.0), 1.0, 0.6, style, &mut Vec::new()).unwrap()
+        fill(&rect(100.0, 20.0), 1.0, 0.6, 0.0, style, &mut Vec::new()).unwrap()
     }
 
     #[test]
@@ -216,6 +231,7 @@ mod tests {
             &rect(100.0, 20.0),
             1.0,
             0.6,
+            0.0,
             CornerStyle::Rectangular,
             &mut w,
         )
@@ -285,7 +301,7 @@ mod tests {
     fn narrow_outline_falls_back_to_rectangular() {
         let mut w = Vec::new();
         // 2 mm wide rows with 1.5 mm pitch: no room for 0.75 mm turn insets.
-        let s = fill(&rect(3.0, 20.0), 1.5, 0.4, CornerStyle::Smooth, &mut w).unwrap();
+        let s = fill(&rect(3.0, 20.0), 1.5, 0.4, 0.0, CornerStyle::Smooth, &mut w).unwrap();
         assert!(w.iter().any(|m| m.contains("rectangular")), "{w:?}");
         assert!(s.path.iter().all(|seg| matches!(seg, PathSeg::Line { .. })));
     }
@@ -296,6 +312,7 @@ mod tests {
             &rect(2.0, 1.0),
             1.0,
             0.6,
+            0.0,
             CornerStyle::Rectangular,
             &mut Vec::new()
         )

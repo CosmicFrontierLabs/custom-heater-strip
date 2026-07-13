@@ -52,6 +52,21 @@ pub fn render(design: &Design) -> String {
         );
     }
 
+    // Rectangular terminal pads as filled graphics on F.Cu, with matching
+    // mask openings.
+    for p in &design.pads {
+        for (layer, grow) in [("F.Cu", 0.0), ("F.Mask", 0.05)] {
+            let _ = writeln!(
+                s,
+                "  (gr_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.01) (type solid)) (fill yes) (layer \"{layer}\"))",
+                p.cx - p.w / 2.0 - grow,
+                p.cy - p.h / 2.0 - grow,
+                p.cx + p.w / 2.0 + grow,
+                p.cy + p.h / 2.0 + grow
+            );
+        }
+    }
+
     // Silkscreen legend strokes on F.SilkS (same artwork as the gerber
     // legend layer, so the KiCad view matches what gets printed).
     for stroke in &design.silk.strokes {

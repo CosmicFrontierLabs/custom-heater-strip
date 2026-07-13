@@ -42,6 +42,10 @@ impl GerberFile {
         let _ = writeln!(self.body, "%ADD{dcode}C,{diameter_mm:.6}*%");
     }
 
+    fn rect_aperture(&mut self, dcode: u32, w_mm: f64, h_mm: f64) {
+        let _ = writeln!(self.body, "%ADD{dcode}R,{w_mm:.6}X{h_mm:.6}*%");
+    }
+
     fn select(&mut self, dcode: u32) {
         let _ = writeln!(self.body, "D{dcode}*");
     }
@@ -96,30 +100,26 @@ impl GerberFile {
 
 pub fn render(design: &Design) -> BTreeMap<String, String> {
     let mut files = BTreeMap::new();
-    let pad_d = design.pad_diameter_mm;
-    let terminals: Vec<Point> = match (design.trace.first(), design.trace.last()) {
-        (Some(first), Some(last)) => vec![first.start(), last.end()],
-        _ => Vec::new(),
-    };
+    let [pad_a, pad_b] = design.pads;
 
-    // Top copper: serpentine strokes + terminal pads.
+    // Top copper: serpentine strokes + rectangular terminal pads.
     let mut cu = GerberFile::new("Copper,L1,Top", "Positive");
     cu.circle_aperture(10, design.trace_width_mm);
-    cu.circle_aperture(11, pad_d);
+    cu.rect_aperture(11, pad_a.w, pad_a.h);
     cu.select(10);
     cu.path(&design.trace);
     cu.select(11);
-    for t in &terminals {
-        cu.flash(t);
+    for p in [&pad_a, &pad_b] {
+        cu.flash(&Point::new(p.cx, p.cy));
     }
     files.insert("heater-F_Cu.gtl".to_string(), cu.finish());
 
-    // Top soldermask: openings over the terminals so they're solderable.
+    // Top soldermask: openings over the pads so they're solderable.
     let mut mask = GerberFile::new("Soldermask,Top", "Negative");
-    mask.circle_aperture(10, pad_d + 0.1);
+    mask.rect_aperture(10, pad_a.w + 0.1, pad_a.h + 0.1);
     mask.select(10);
-    for t in &terminals {
-        mask.flash(t);
+    for p in [&pad_a, &pad_b] {
+        mask.flash(&Point::new(p.cx, p.cy));
     }
     files.insert("heater-F_Mask.gts".to_string(), mask.finish());
 
@@ -174,6 +174,11 @@ mod tests {
         let cu = &files["heater-F_Cu.gtl"];
         assert_eq!(cu.matches("D03*").count(), 2, "expected 2 terminal flashes");
         assert!(cu.contains("D01*"), "no draw commands in copper layer");
+        assert!(cu.contains("%ADD11R,"), "pads should use a rect aperture");
+        assert!(
+            files["heater-F_Mask.gts"].contains("%ADD10R,"),
+            "mask openings should be rectangular"
+        );
     }
 
     #[test]
