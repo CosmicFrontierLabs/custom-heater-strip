@@ -8,7 +8,6 @@ use crate::{outline::Polygon, EngineError, PathSeg, Point};
 
 pub struct Serpentine {
     pub path: Vec<PathSeg>,
-    pub length_mm: f64,
 }
 
 struct Row {
@@ -201,8 +200,7 @@ pub fn fill(
         }
     }
 
-    let length_mm = path.iter().map(|s| s.length()).sum();
-    Ok(Serpentine { path, length_mm })
+    Ok(Serpentine { path })
 }
 
 #[cfg(test)]
@@ -236,13 +234,9 @@ mod tests {
             &mut w,
         )
         .unwrap();
+        let len: f64 = s.path.iter().map(|seg| seg.length()).sum();
         let est = (20.0 - 2.0 * 0.6) / 1.0 * (100.0 - 2.0 * 0.6);
-        assert!(
-            (s.length_mm - est).abs() / est < 0.15,
-            "len {} vs est {}",
-            s.length_mm,
-            est
-        );
+        assert!((len - est).abs() / est < 0.15, "len {len} vs est {est}");
         assert!(w.is_empty(), "{w:?}");
     }
 
@@ -290,9 +284,10 @@ mod tests {
     fn smooth_is_shorter_than_rectangular() {
         // Arc turnarounds trade π·r of arc for 2r of trimmed row on each
         // side plus the 2r connector: net shorter path.
-        let rect_len = fill_style(CornerStyle::Rectangular).length_mm;
-        let smooth_len = fill_style(CornerStyle::Smooth).length_mm;
-        let miter_len = fill_style(CornerStyle::Mitered).length_mm;
+        let len = |st| -> f64 { fill_style(st).path.iter().map(|seg| seg.length()).sum() };
+        let rect_len = len(CornerStyle::Rectangular);
+        let smooth_len = len(CornerStyle::Smooth);
+        let miter_len = len(CornerStyle::Mitered);
         assert!(smooth_len < rect_len);
         assert!(miter_len < rect_len);
     }
