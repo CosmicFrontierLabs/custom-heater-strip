@@ -182,17 +182,23 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
         &outline,
         solved.pitch_mm,
         inset,
-        plan.zone_width_mm,
+        plan.reserve,
         req.corner_style,
         &mut warnings,
     )?;
 
     // Full electrical path: pad A → feed → fill pattern → feed → pad B.
+    // Corner-exit patterns route via the full-height left lane; center-exit
+    // patterns (spiral, concentric) via the pocket-internal right lane.
+    let lane = match req.fill_kind {
+        shared::FillKind::DoubleSpiral | shared::FillKind::Concentric => terminals::Lane::Right,
+        _ => terminals::Lane::Left,
+    };
     let row_start = fill_path.first().expect("nonempty path").start();
     let row_end = fill_path.last().expect("nonempty path").end();
-    let mut trace = plan.feed_start(row_start);
+    let mut trace = plan.feed_start(lane, row_start);
     trace.extend(fill_path);
-    trace.extend(plan.feed_end(row_end));
+    trace.extend(plan.feed_end(lane, row_end));
     let length_mm: f64 = trace.iter().map(|s| s.length()).sum();
 
     let refined = solver::refine(req, &solved, length_mm, &mut warnings);
@@ -215,7 +221,7 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
     let mut silk_warnings = Vec::new();
     let silk = silk::generate(
         &outline,
-        plan.zone_width_mm,
+        plan.reserve.pocket_x1 - outline.bbox().0.x,
         req,
         &report,
         &mut silk_warnings,

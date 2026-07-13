@@ -11,29 +11,41 @@
 
 use cavalier_contours::polyline::{BooleanOp, PlineSource, PlineSourceMut, Polyline};
 
+use super::Reserve;
 use crate::{outline::Polygon, EngineError, PathSeg, Point};
 
 pub fn fill(
     outline: &Polygon,
     pitch_mm: f64,
     inset_mm: f64,
-    left_reserved_mm: f64,
+    reserve: Reserve,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathSeg>, EngineError> {
     let (min, max) = outline.bbox();
     let cy = (min.y + max.y) / 2.0;
-    let zone_edge = min.x + inset_mm + left_reserved_mm;
 
-    // Region = outline minus the terminal zone strip at the left.
+    // Region = outline minus the solder-pad pocket, so the rings wrap the
+    // pads and stay dense above and below them.
     let mut region = to_pline(outline);
-    if left_reserved_mm > 0.0 {
-        let mut zone = Polyline::new_closed();
-        zone.add(min.x - 1.0, min.y - 1.0, 0.0);
-        zone.add(zone_edge - inset_mm, min.y - 1.0, 0.0);
-        zone.add(zone_edge - inset_mm, max.y + 1.0, 0.0);
-        zone.add(min.x - 1.0, max.y + 1.0, 0.0);
-        ensure_ccw(&mut zone);
-        let result = region.boolean(&zone, BooleanOp::Not);
+    let notch_x1 = reserve.pocket_x1 - inset_mm;
+    if notch_x1 > min.x {
+        let notch_y0 = if reserve.pocket_y0.is_finite() {
+            reserve.pocket_y0 + inset_mm
+        } else {
+            min.y - 1.0
+        };
+        let notch_y1 = if reserve.pocket_y1.is_finite() {
+            reserve.pocket_y1 - inset_mm
+        } else {
+            max.y + 1.0
+        };
+        let mut pocket = Polyline::new_closed();
+        pocket.add(min.x - 1.0, notch_y0, 0.0);
+        pocket.add(notch_x1, notch_y0, 0.0);
+        pocket.add(notch_x1, notch_y1, 0.0);
+        pocket.add(min.x - 1.0, notch_y1, 0.0);
+        ensure_ccw(&mut pocket);
+        let result = region.boolean(&pocket, BooleanOp::Not);
         region = result
             .pos_plines
             .into_iter()
@@ -41,7 +53,7 @@ pub fn fill(
             .max_by(|a, b| a.area().abs().partial_cmp(&b.area().abs()).unwrap())
             .ok_or_else(|| {
                 EngineError::OutlineTooSmall(
-                    "outline vanishes after reserving the terminal zone".into(),
+                    "outline vanishes after reserving the terminal pocket".into(),
                 )
             })?;
         ensure_ccw(&mut region);
@@ -82,8 +94,10 @@ pub fn fill(
         )));
     }
 
-    // Cut each ring at the left-side channel and chain them.
-    let w = pitch_mm / 2.0;
+    // Cut each ring at the left-side channel and chain them. The channel
+    // is a full pitch tall on each side of the centerline so the two feed
+    // runs (terminal A at cy−p, terminal B at cy) keep their clearance.
+    let w = pitch_mm;
     let mut path: Vec<PathSeg> = Vec::new();
     let mut prev_exit: Option<(Point, bool)> = None; // (point, exited_at_top)
     for (k, ring) in rings.iter().enumerate() {
@@ -282,13 +296,13 @@ mod tests {
     #[test]
     fn rings_chain_into_single_connected_path() {
         let mut w = Vec::new();
-        let path = fill(&rect(60.0, 20.0), 1.0, 0.6, 6.0, &mut w).unwrap();
+        let path = fill(&rect(60.0, 20.0), 1.0, 0.6, Reserve::column(6.6), &mut w).unwrap();
         assert_path_well_formed(&path, 0.0, 0.0, 60.0, 20.0);
         let start = path.first().unwrap().start();
         let end = path.last().unwrap().end();
-        // Terminal A on the outer ring near the zone, above the centerline.
+        // Terminal A on the outer ring near the pocket, above the centerline.
         assert!(start.x < 10.0, "start x {}", start.x);
-        assert!((start.y - (10.0 - 0.5)).abs() < 0.1, "start y {}", start.y);
+        assert!((start.y - (10.0 - 1.0)).abs() < 0.1, "start y {}", start.y);
         // Terminal B on the channel centerline, inward of A.
         assert!((end.y - 10.0).abs() < 1e-6, "end y {}", end.y);
         assert!(end.x > start.x, "end should be inward of start");
@@ -298,7 +312,14 @@ mod tests {
     fn channel_centerline_stays_clear() {
         // No copper may cross the corridor y=cy between the zone edge and
         // the inner terminal (the feed run needs it).
-        let path = fill(&rect(60.0, 20.0), 1.0, 0.6, 6.0, &mut Vec::new()).unwrap();
+        let path = fill(
+            &rect(60.0, 20.0),
+            1.0,
+            0.6,
+            Reserve::column(6.6),
+            &mut Vec::new(),
+        )
+        .unwrap();
         let cy = 10.0;
         let end = path.last().unwrap().end();
         for seg in &path[..path.len() - 1] {
@@ -317,7 +338,14 @@ mod tests {
     #[test]
     fn ring_count_matches_pitch() {
         // 20 mm tall rect, inset 0.6, pitch 1.0 → half-height 9.4 → ~9 rings.
-        let path = fill(&rect(60.0, 20.0), 1.0, 0.6, 0.0, &mut Vec::new()).unwrap();
+        let path = fill(
+            &rect(60.0, 20.0),
+            1.0,
+            0.6,
+            Reserve::none(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         // Count crossings of a vertical line at x=30 above center: one per ring.
         let crossings = path
             .iter()
@@ -336,6 +364,6 @@ mod tests {
 
     #[test]
     fn tiny_outline_rejected() {
-        assert!(fill(&rect(4.0, 3.0), 1.0, 0.6, 0.0, &mut Vec::new()).is_err());
+        assert!(fill(&rect(4.0, 3.0), 1.0, 0.6, Reserve::none(), &mut Vec::new()).is_err());
     }
 }

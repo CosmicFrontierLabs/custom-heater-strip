@@ -7,13 +7,14 @@
 //! Rectangular outlines only: the curve is generated over the bounding box,
 //! so a non-rectangular outline would leave copper outside the board.
 
+use super::Reserve;
 use crate::{outline::Polygon, EngineError, PathSeg, Point};
 
 pub fn fill(
     outline: &Polygon,
     pitch_mm: f64,
     inset_mm: f64,
-    left_reserved_mm: f64,
+    reserve: Reserve,
     _warnings: &mut Vec<String>,
 ) -> Result<Vec<PathSeg>, EngineError> {
     let (min, max) = outline.bbox();
@@ -27,7 +28,7 @@ pub fn fill(
         ));
     }
 
-    let x0 = min.x + inset_mm + left_reserved_mm;
+    let x0 = (min.x + inset_mm).max(reserve.lane_edge.max(reserve.pocket_x1));
     let y0 = min.y + inset_mm;
     let w = max.x - inset_mm - x0;
     let h = max.y - inset_mm - y0;
@@ -172,7 +173,14 @@ mod tests {
 
     #[test]
     fn fill_produces_connected_inbounds_path() {
-        let path = fill(&rect(60.0, 20.0), 1.0, 0.6, 5.0, &mut Vec::new()).unwrap();
+        let path = fill(
+            &rect(60.0, 20.0),
+            1.0,
+            0.6,
+            Reserve::column(5.6),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_path_well_formed(&path, 5.6, 0.6, 60.0 - 0.6, 20.0 - 0.6);
         let start = path.first().unwrap().start();
         let end = path.last().unwrap().end();
@@ -192,7 +200,7 @@ mod tests {
             ],
         };
         assert!(matches!(
-            fill(&tri, 1.0, 0.6, 0.0, &mut Vec::new()),
+            fill(&tri, 1.0, 0.6, Reserve::none(), &mut Vec::new()),
             Err(EngineError::Infeasible(_))
         ));
     }

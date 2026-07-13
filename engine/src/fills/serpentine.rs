@@ -6,6 +6,7 @@
 use shared::CornerStyle;
 
 use super::offset::{offset_path, reverse_path};
+use super::Reserve;
 use crate::{outline::Polygon, EngineError, PathSeg, Point};
 
 /// Whether the row count must be even (path ends back at the left edge,
@@ -24,13 +25,12 @@ struct Row {
 }
 
 /// Fill `outline` with a serpentine of the given pitch, keeping `inset` mm
-/// of clearance from the boundary and `left_reserved_mm` free at the left
-/// edge for the terminal zone.
+/// of clearance from the boundary and honoring the terminal `reserve`.
 pub fn fill(
     outline: &Polygon,
     pitch_mm: f64,
     inset_mm: f64,
-    left_reserved_mm: f64,
+    reserve: Reserve,
     style: CornerStyle,
     parity: RowParity,
     warnings: &mut Vec<String>,
@@ -70,11 +70,11 @@ pub fn fill(
         let y = y_start + i as f64 * pitch_mm;
         let hits = outline.scanline_hits(y);
         // Pair up even-odd crossings into inside spans, shrunk by the inset
-        // and pushed right of the reserved terminal zone.
-        let zone_edge = min.x + inset_mm + left_reserved_mm;
+        // and pushed right of the terminal reserve at this height.
+        let bound = reserve.left_bound(y);
         let mut spans: Vec<(f64, f64)> = hits
             .chunks_exact(2)
-            .map(|c| ((c[0] + inset_mm).max(zone_edge), c[1] - inset_mm))
+            .map(|c| ((c[0] + inset_mm).max(bound), c[1] - inset_mm))
             .filter(|(a, b)| b > a)
             .collect();
         if spans.is_empty() {
@@ -220,7 +220,7 @@ pub fn fill_wavy(
     outline: &Polygon,
     pitch_mm: f64,
     inset_mm: f64,
-    left_reserved_mm: f64,
+    reserve: Reserve,
     style: CornerStyle,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathSeg>, EngineError> {
@@ -228,7 +228,7 @@ pub fn fill_wavy(
         outline,
         pitch_mm,
         inset_mm,
-        left_reserved_mm,
+        reserve,
         style,
         RowParity::Even,
         warnings,
@@ -275,7 +275,7 @@ pub fn fill_counterflow(
     outline: &Polygon,
     pitch_mm: f64,
     inset_mm: f64,
-    left_reserved_mm: f64,
+    reserve: Reserve,
     style: CornerStyle,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathSeg>, EngineError> {
@@ -285,7 +285,7 @@ pub fn fill_counterflow(
         outline,
         2.0 * pitch_mm,
         inset_mm + half,
-        left_reserved_mm,
+        reserve.expand(half),
         style,
         RowParity::Odd,
         warnings,
@@ -363,7 +363,7 @@ mod tests {
             &rect(100.0, 20.0),
             1.0,
             0.6,
-            0.0,
+            Reserve::none(),
             style,
             RowParity::Even,
             &mut Vec::new(),
@@ -382,7 +382,7 @@ mod tests {
             &rect(100.0, 20.0),
             1.0,
             0.6,
-            0.0,
+            Reserve::none(),
             CornerStyle::Rectangular,
             RowParity::Even,
             &mut w,
@@ -429,7 +429,7 @@ mod tests {
             &rect(100.0, 20.0),
             1.0,
             0.6,
-            5.0,
+            Reserve::column(5.0),
             CornerStyle::Rectangular,
             RowParity::Odd,
             &mut Vec::new(),
@@ -447,7 +447,7 @@ mod tests {
             &rect(100.0, 20.0),
             1.0,
             0.6,
-            0.0,
+            Reserve::none(),
             CornerStyle::Rectangular,
             &mut Vec::new(),
         )
@@ -466,7 +466,15 @@ mod tests {
     fn counterflow_terminals_adjacent_and_path_connected() {
         for style in CornerStyle::ALL {
             let mut w = Vec::new();
-            let s = fill_counterflow(&rect(100.0, 20.0), 1.0, 0.6, 5.0, style, &mut w).unwrap();
+            let s = fill_counterflow(
+                &rect(100.0, 20.0),
+                1.0,
+                0.6,
+                Reserve::column(5.0),
+                style,
+                &mut w,
+            )
+            .unwrap();
             assert_path_well_formed(&s, 0.0, 0.0, 100.0, 20.0);
             let start = s.first().unwrap().start();
             let end = s.last().unwrap().end();
@@ -487,7 +495,7 @@ mod tests {
             &rect(100.0, 20.0),
             1.0,
             0.6,
-            0.0,
+            Reserve::none(),
             CornerStyle::Smooth,
             &mut Vec::new(),
         )
@@ -506,7 +514,7 @@ mod tests {
             &rect(2.0, 1.0),
             1.0,
             0.6,
-            0.0,
+            Reserve::none(),
             CornerStyle::Rectangular,
             RowParity::Even,
             &mut Vec::new()

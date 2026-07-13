@@ -8,17 +8,18 @@
 //! round outlines, coverage-limited on long strips (a warning reports the
 //! covered fraction).
 
+use super::Reserve;
 use crate::{outline::Polygon, EngineError, PathSeg, Point};
 
 pub fn fill(
     outline: &Polygon,
     pitch_mm: f64,
     inset_mm: f64,
-    left_reserved_mm: f64,
+    reserve: Reserve,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathSeg>, EngineError> {
     let (min, max) = outline.bbox();
-    let left = min.x + inset_mm + left_reserved_mm;
+    let left = (min.x + inset_mm).max(reserve.pocket_x1);
     let right = max.x - inset_mm;
     let top = min.y + inset_mm;
     let bottom = max.y - inset_mm;
@@ -143,7 +144,7 @@ mod tests {
     #[test]
     fn spiral_fills_square_with_adjacent_left_terminals() {
         let mut w = Vec::new();
-        let path = fill(&rect(50.0, 50.0), 1.0, 0.6, 6.0, &mut w).unwrap();
+        let path = fill(&rect(50.0, 50.0), 1.0, 0.6, Reserve::column(6.6), &mut w).unwrap();
         assert_path_well_formed(&path, 6.6 - 1e-6, 0.6, 50.0 - 0.6, 50.0 - 0.6);
         let start = path.first().unwrap().start();
         let end = path.last().unwrap().end();
@@ -160,7 +161,7 @@ mod tests {
     #[test]
     fn strip_outline_warns_about_coverage() {
         let mut w = Vec::new();
-        let path = fill(&rect(100.0, 20.0), 0.5, 0.6, 5.0, &mut w);
+        let path = fill(&rect(100.0, 20.0), 0.5, 0.6, Reserve::column(5.6), &mut w);
         let path = path.unwrap();
         assert!(w.iter().any(|m| m.contains("inscribed circle")), "{w:?}");
         assert!(!path.is_empty());
@@ -170,7 +171,14 @@ mod tests {
     fn radial_pitch_is_uniform() {
         // Sample the path's distance from center along the +x axis: hits
         // should be ~pitch apart.
-        let path = fill(&rect(50.0, 50.0), 1.0, 0.6, 0.0, &mut Vec::new()).unwrap();
+        let path = fill(
+            &rect(50.0, 50.0),
+            1.0,
+            0.6,
+            Reserve::none(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         let (cx, cy) = (25.3, 25.0); // region center with zone 0: (0.6+49.4)/2=25.0 + shift
         let mut xs: Vec<f64> = path
             .iter()
@@ -200,6 +208,6 @@ mod tests {
 
     #[test]
     fn too_small_region_rejected() {
-        assert!(fill(&rect(8.0, 8.0), 1.0, 0.6, 0.0, &mut Vec::new()).is_err());
+        assert!(fill(&rect(8.0, 8.0), 1.0, 0.6, Reserve::none(), &mut Vec::new()).is_err());
     }
 }

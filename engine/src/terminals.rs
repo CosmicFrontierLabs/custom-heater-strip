@@ -1,23 +1,27 @@
-//! Terminal layout: a reserved zone at the left edge holding two rectangular
-//! solder pads, stacked symmetrically about the board's horizontal
-//! centerline, with feed runs connecting them to the serpentine's ends.
+//! Terminal layout: the solder pads live in a small pocket at the left
+//! edge, centered on the board's horizontal centerline, so the fill can run
+//! dense above, below, and to the right of them.
 //!
 //! ```text
-//!   ┌─────────────────────────────┐
-//!   │ │   ┌──────── row 0 ──────► │
-//!   │ │   └──◄─────────────────┐  │
-//!   │ │ ┌────┐ ...             │  │
-//!   │ └─►pad A│                ┆  │
-//!   │   ├────┤ │ feed B        ┆  │
-//!   │ ┌─►pad B◄┘               │  │
-//!   │ │   ┌──────── row n-1 ◄──┘  │
-//!   └─────────────────────────────┘
+//!   ┌───────────────────────────────┐
+//!   │ ┆ ═══════════ rows ═════════  │   rows outside the band reach the
+//!   │ ┆ ═══════════════════════════ │   thin lane corridor (┆)
+//!   │ ┆ ┌────┐.  ═══════ rows ════  │ ┐
+//!   │ ┆ │pad A│.  ═════════════════ │ │ pocket band: rows stop right of
+//!   │ ┆ ├────┤.  ═════════════════  │ │ the pocket
+//!   │ ┆ │pad B│.  ═════════════════ │ ┘
+//!   │ ┆ └────┘.  ════════════════   │
+//!   │ ┆ ═══════════════════════════ │
+//!   └───────────────────────────────┘
 //! ```
-//! Feed A runs up the left lane to row 0; feed B runs up the right lane
-//! (between the pads and the fill) from the last row. Both lanes stay clear
-//! of each other because pad A connects at the top half and pad B at the
-//! bottom half.
+//!
+//! Two feed lanes: the **left lane** (┆) runs the full height just left of
+//! the pads — serpentine-family patterns use it to reach their top/bottom
+//! corner terminals. The **right lane** (.) lives inside the pocket —
+//! spiral/concentric patterns whose terminals exit at the centerline use it
+//! without ever crossing pad copper.
 
+use crate::fills::Reserve;
 use crate::{EngineError, PathSeg, Point};
 
 /// A rectangular solder pad, center + size, board mm.
@@ -29,14 +33,22 @@ pub struct PadRect {
     pub h: f64,
 }
 
+/// Which lane a pattern's feeds route through.
+#[derive(Debug, Clone, Copy)]
+pub enum Lane {
+    /// Full-height corridor left of the pads.
+    Left,
+    /// Pocket-internal corridor right of the pads.
+    Right,
+}
+
 pub struct TerminalPlan {
-    /// Width of the reserved strip at the left of the fill area.
-    pub zone_width_mm: f64,
+    /// What the fill must keep clear.
+    pub reserve: Reserve,
     /// [pad A (upper), pad B (lower)], symmetric about the centerline.
     pub pads: [PadRect; 2],
-    /// x of the left feed lane (pad A) and right feed lane (pad B).
-    x_a: f64,
-    x_b: f64,
+    x_left: f64,
+    x_right: f64,
 }
 
 pub fn layout(
@@ -61,19 +73,21 @@ pub fn layout(
     let pad_w = 1.6 * s;
     let pad_h = s;
     let pad_gap = (2.0 * gap_mm).max(0.8);
+    let clearance = (2.0 * gap_mm).max(0.5);
 
     let lane = (2.0 * (trace_width_mm + gap_mm)).max(1.2);
-    let zone_w = 2.0 * lane + pad_w;
+    let pocket_w = 2.0 * lane + pad_w;
 
     let usable_w = max.x - min.x - 2.0 * inset_mm;
     let usable_h = max.y - min.y - 2.0 * inset_mm;
-    if zone_w > usable_w / 2.0 {
+    if pocket_w > usable_w / 2.0 {
         return Err(EngineError::OutlineTooSmall(format!(
-            "terminal zone ({zone_w:.1} mm) doesn't leave room to route; \
+            "terminal pocket ({pocket_w:.1} mm) doesn't leave room to route; \
              outline is only {usable_w:.1} mm wide inside margins"
         )));
     }
-    if 2.0 * pad_h + pad_gap > usable_h {
+    let stack = 2.0 * pad_h + pad_gap;
+    if stack + 2.0 * clearance > usable_h {
         return Err(EngineError::OutlineTooSmall(format!(
             "two {pad_h:.1} mm pads don't fit the {usable_h:.1} mm outline \
              height; shrink the solder pad size"
@@ -82,10 +96,16 @@ pub fn layout(
 
     let x0 = min.x + inset_mm;
     let cy = (min.y + max.y) / 2.0;
-    let pcx = x0 + lane + pad_w / 2.0;
+    let px0 = x0 + lane;
+    let pcx = px0 + pad_w / 2.0;
 
     Ok(TerminalPlan {
-        zone_width_mm: zone_w,
+        reserve: Reserve {
+            lane_edge: px0,
+            pocket_x1: px0 + pad_w + lane,
+            pocket_y0: cy - stack / 2.0 - clearance,
+            pocket_y1: cy + stack / 2.0 + clearance,
+        },
         pads: [
             PadRect {
                 cx: pcx,
@@ -100,53 +120,50 @@ pub fn layout(
                 h: pad_h,
             },
         ],
-        x_a: x0 + lane / 2.0,
-        x_b: x0 + lane + pad_w + lane / 2.0,
+        x_left: x0 + lane / 2.0,
+        x_right: px0 + pad_w + lane / 2.0,
     })
 }
 
 impl TerminalPlan {
-    /// Path from pad A's center up the left lane to the serpentine's start.
-    pub fn feed_start(&self, row_start: Point) -> Vec<PathSeg> {
-        let a = self.pads[0];
-        let corner1 = Point::new(self.x_a, a.cy);
-        let corner2 = Point::new(self.x_a, row_start.y);
-        vec![
-            PathSeg::Line {
-                a: Point::new(a.cx, a.cy),
-                b: corner1,
-            },
-            PathSeg::Line {
-                a: corner1,
-                b: corner2,
-            },
-            PathSeg::Line {
-                a: corner2,
-                b: row_start,
-            },
-        ]
+    fn lane_x(&self, lane: Lane) -> f64 {
+        match lane {
+            Lane::Left => self.x_left,
+            Lane::Right => self.x_right,
+        }
     }
 
-    /// Path from the serpentine's end up the right lane into pad B.
-    pub fn feed_end(&self, row_end: Point) -> Vec<PathSeg> {
-        let b = self.pads[1];
-        let corner1 = Point::new(self.x_b, row_end.y);
-        let corner2 = Point::new(self.x_b, b.cy);
-        vec![
-            PathSeg::Line {
-                a: row_end,
-                b: corner1,
-            },
-            PathSeg::Line {
-                a: corner1,
-                b: corner2,
-            },
-            PathSeg::Line {
-                a: corner2,
-                b: Point::new(b.cx, b.cy),
-            },
-        ]
+    /// Path from pad A's center via the lane to the fill's start terminal.
+    pub fn feed_start(&self, lane: Lane, t: Point) -> Vec<PathSeg> {
+        let a = self.pads[0];
+        let x = self.lane_x(lane);
+        segments(&[
+            Point::new(a.cx, a.cy),
+            Point::new(x, a.cy),
+            Point::new(x, t.y),
+            t,
+        ])
     }
+
+    /// Path from the fill's end terminal via the lane into pad B.
+    pub fn feed_end(&self, lane: Lane, t: Point) -> Vec<PathSeg> {
+        let b = self.pads[1];
+        let x = self.lane_x(lane);
+        segments(&[
+            t,
+            Point::new(x, t.y),
+            Point::new(x, b.cy),
+            Point::new(b.cx, b.cy),
+        ])
+    }
+}
+
+/// Consecutive points → line segments, skipping degenerate hops.
+fn segments(pts: &[Point]) -> Vec<PathSeg> {
+    pts.windows(2)
+        .filter(|w| w[0].dist(&w[1]) > 1e-9)
+        .map(|w| PathSeg::Line { a: w[0], b: w[1] })
+        .collect()
 }
 
 #[cfg(test)]
@@ -172,17 +189,30 @@ mod tests {
         assert!((cy - p.pads[0].cy - (p.pads[1].cy - cy)).abs() < 1e-9);
         assert_eq!(p.pads[0].cx, p.pads[1].cx);
         assert_eq!(p.pads[0].w, p.pads[1].w);
-        // Adjacent: the gap between them is small relative to pad height.
         let gap = (p.pads[1].cy - p.pads[1].h / 2.0) - (p.pads[0].cy + p.pads[0].h / 2.0);
         assert!(gap > 0.0 && gap < p.pads[0].h, "gap {gap}");
     }
 
     #[test]
-    fn feeds_connect_pads_to_rows_continuously() {
+    fn pocket_band_hugs_the_pads() {
         let p = plan();
-        let row_start = Point::new(p.zone_width_mm + 0.6, 1.0);
-        let row_end = Point::new(p.zone_width_mm + 0.6, 19.0);
-        let fs = p.feed_start(row_start);
+        // The band covers both pads plus clearance and no more than ~2 mm
+        // beyond them.
+        let pads_top = p.pads[0].cy - p.pads[0].h / 2.0;
+        let pads_bot = p.pads[1].cy + p.pads[1].h / 2.0;
+        assert!(p.reserve.pocket_y0 < pads_top && p.reserve.pocket_y0 > pads_top - 2.0);
+        assert!(p.reserve.pocket_y1 > pads_bot && p.reserve.pocket_y1 < pads_bot + 2.0);
+        // Rows outside the band may come much further left than inside it.
+        assert!(p.reserve.lane_edge < p.reserve.pocket_x1);
+        assert!(p.reserve.left_bound(1.0) < p.reserve.left_bound(10.0));
+    }
+
+    #[test]
+    fn left_feeds_connect_pads_to_corner_terminals() {
+        let p = plan();
+        let t_start = Point::new(p.reserve.lane_edge, 1.0);
+        let t_end = Point::new(p.reserve.lane_edge, 19.0);
+        let fs = p.feed_start(Lane::Left, t_start);
         assert!(
             fs.first()
                 .unwrap()
@@ -190,9 +220,9 @@ mod tests {
                 .dist(&Point::new(p.pads[0].cx, p.pads[0].cy))
                 < 1e-9
         );
-        assert!(fs.last().unwrap().end().dist(&row_start) < 1e-9);
-        let fe = p.feed_end(row_end);
-        assert!(fe.first().unwrap().start().dist(&row_end) < 1e-9);
+        assert!(fs.last().unwrap().end().dist(&t_start) < 1e-9);
+        let fe = p.feed_end(Lane::Left, t_end);
+        assert!(fe.first().unwrap().start().dist(&t_end) < 1e-9);
         assert!(
             fe.last()
                 .unwrap()
@@ -200,10 +230,32 @@ mod tests {
                 .dist(&Point::new(p.pads[1].cx, p.pads[1].cy))
                 < 1e-9
         );
-        // Lanes are inside the zone, left of the fill area.
+        // Left-lane verticals stay left of the pads.
         for seg in fs.iter().chain(fe.iter()) {
-            for pt in [seg.start(), seg.end()] {
-                assert!(pt.x <= p.zone_width_mm + 0.6 + 1e-9);
+            let (a, b) = (seg.start(), seg.end());
+            if (a.x - b.x).abs() < 1e-9 {
+                assert!(a.x < p.pads[0].cx - p.pads[0].w / 2.0);
+            }
+        }
+    }
+
+    #[test]
+    fn right_feeds_stay_clear_of_pad_copper() {
+        let p = plan();
+        // Center-exit terminals like the concentric fill's.
+        let t_start = Point::new(p.reserve.pocket_x1, 9.0);
+        let t_end = Point::new(p.reserve.pocket_x1 + 8.0, 10.0);
+        let pad_right = p.pads[0].cx + p.pads[0].w / 2.0;
+        for seg in p
+            .feed_start(Lane::Right, t_start)
+            .iter()
+            .chain(p.feed_end(Lane::Right, t_end).iter())
+        {
+            let (a, b) = (seg.start(), seg.end());
+            // Vertical runs sit right of the pads; horizontal runs at pad
+            // center height only touch their own pad.
+            if (a.x - b.x).abs() < 1e-9 {
+                assert!(a.x > pad_right, "vertical at {} crosses pads", a.x);
             }
         }
     }
