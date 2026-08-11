@@ -1,0 +1,87 @@
+body {
+    font-family: sans-serif;
+    margin: 0;
+    padding: 2rem;
+    background: #1a1a2e;
+    color: #eee;
+}
+
+h1 {
+    color: #e94560;
+}
+
+.status {
+    padding: 0.5rem 1rem;
+    background: #16213e;
+    border-radius: 4px;
+    display: inline-block;
+    margin-top: 1rem;
+}
+
+/* --- Heater designer --- */
+.designer { max-width: 900px; margin: 0 auto; }
+.tagline { color: #9aa0b8; margin-top: -0.5rem; }
+.panel {
+    background: #16213e;
+    border-radius: 8px;
+    padding: 1rem 1.5rem;
+    margin: 1rem 0;
+}
+.panel h2 { font-size: 1rem; color: #e94560; margin: 0.5rem 0; }
+.fields { display: flex; flex-wrap: wrap; gap: 0.75rem 1.5rem; margin-bottom: 0.75rem; }
+.field { display: flex; flex-direction: column; gap: 0.25rem; }
+.field-label { font-size: 0.8rem; color: #9aa0b8; }
+.field-input input {
+    width: 6rem;
+    background: #0f1830;
+    color: #eee;
+    border: 1px solid #2a3a5e;
+    border-radius: 4px;
+    padding: 0.35rem 0.5rem;
+}
+.unit { margin-left: 0.4rem; color: #9aa0b8; font-size: 0.85rem; }
+.generate {
+    background: #e94560;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 0.6rem 1.4rem;
+    font-size: 1rem;
+    cursor: pointer;
+}
+.generate:disabled { opacity: 0.5; cursor: wait; }
+.file-ok { margin-left: 0.75rem; color: #7ec97e; }
+.file-hint { margin-left: 0.75rem; color: #9aa0b8; font-size: 0.85rem; }
+.error {
+    background: #3d1424;
+    border: 1px solid #e94560;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin: 1rem 0;
+}
+.warning {
+    background: #3a2f14;
+    border: 1px solid #c9a03d;
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+    font-size: 0.9rem;
+}
+.preview { background: #0f1830; border-radius: 6px; padding: 1rem; }
+.preview svg { width: 100%; height: auto; display: block; }
+.report td { padding: 0.3rem 1rem 0.3rem 0; }
+.report td:first-child { color: #9aa0b8; }
+.downloads a { color: #7ec3e9; }
+.field select {
+    background: #0f1830;
+    color: #eee;
+    border: 1px solid #2a3a5e;
+    border-radius: 4px;
+    padding: 0.35rem 0.5rem;
+    margin-bottom: 0.75rem;
+}
+.mode-row { display: flex; gap: 1.5rem; margin-bottom: 0.75rem; }
+.mode-row label { cursor: pointer; }
+.slider-field { display: block; margin-top: 0.5rem; }
+.slider-field input[type="range"] { width: 100%; max-width: 24rem; accent-color: #e94560; }
+.dl-label { color: #9aa0b8; font-size: 0.85rem; }
