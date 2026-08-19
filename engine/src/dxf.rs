@@ -10,7 +10,7 @@
 use dxf::entities::EntityType;
 use dxf::enums::Units;
 use dxf::Drawing;
-use shared::{DxfPolygon, PolygonRole};
+use shared::{DxfPolygon, DxfUploadResponse, PolygonRole};
 
 use crate::outline::Polygon;
 use crate::{EngineError, Point};
@@ -24,12 +24,25 @@ const CIRCLE_SEGMENTS: usize = 64;
 /// the entity is almost certainly a dimension tick or a stray dot.
 const MIN_AREA_MM2: f64 = 0.01;
 
-/// Parse a DXF and return every closed ring it contains, in board mm.
+/// Parse a DXF and return every closed ring it contains, in board mm,
+/// appending any advisories to `warnings`.
 pub fn parse(bytes: &[u8], warnings: &mut Vec<String>) -> Result<Vec<DxfPolygon>, EngineError> {
+    let resp = extract(bytes)?;
+    warnings.extend(resp.warnings);
+    Ok(resp.polygons)
+}
+
+/// Parse a DXF into the upload response the picker consumes.
+///
+/// Decodes the file once: the drawing units live in the same header as the
+/// entities, so there is no reason to read it twice.
+pub fn extract(bytes: &[u8]) -> Result<DxfUploadResponse, EngineError> {
+    let warnings = &mut Vec::new();
     let mut cursor = std::io::BufReader::new(std::io::Cursor::new(bytes));
     let drawing = Drawing::load(&mut cursor).map_err(|e| EngineError::DxfParse(e.to_string()))?;
 
     let units = drawing.header.default_drawing_units;
+    let units_label = format!("{units:?}");
     let scale = units_to_mm(units);
     if units == Units::Unitless {
         warnings.push(
@@ -182,7 +195,11 @@ pub fn parse(bytes: &[u8], warnings: &mut Vec<String>) -> Result<Vec<DxfPolygon>
     for (i, p) in out.iter_mut().enumerate() {
         p.id = i as u32;
     }
-    Ok(out)
+    Ok(DxfUploadResponse {
+        polygons: out,
+        units: units_label,
+        warnings: std::mem::take(warnings),
+    })
 }
 
 /// Seed a role from the layer name so conventionally-named files come in
@@ -232,15 +249,6 @@ fn units_to_mm(u: Units) -> f64 {
         Units::USSurveyInch => 25.400_050_800_101_6,
         Units::USSurveyYard => 914.401_828_803_658,
         Units::USSurveyMile => 1_609_347.218_694_437,
-    }
-}
-
-/// Human-readable `$INSUNITS` name for the upload response.
-pub fn units_label(bytes: &[u8]) -> String {
-    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(bytes));
-    match Drawing::load(&mut cursor) {
-        Ok(d) => format!("{:?}", d.header.default_drawing_units),
-        Err(_) => "unknown".to_string(),
     }
 }
 

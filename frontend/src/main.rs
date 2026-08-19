@@ -1,8 +1,5 @@
-use base64::Engine as _;
-use gloo_net::http::Request;
 use shared::{
-    DesignError, DesignRequest, DesignResponse, DxfPolygon, DxfUploadRequest, DxfUploadResponse,
-    GeometrySpec, PolygonRole,
+    DesignRequest, DesignResponse, DxfPolygon, DxfUploadResponse, GeometrySpec, PolygonRole,
 };
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
@@ -239,40 +236,16 @@ fn designer() -> Html {
             busy.set(true);
             spawn_local(async move {
                 match gloo_file::futures::read_as_bytes(&gloo_file::File::from(file)).await {
-                    Ok(bytes) => {
-                        let req = DxfUploadRequest {
-                            dxf_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-                        };
-                        match Request::post("/api/dxf").json(&req) {
-                            Ok(r) => match r.send().await {
-                                Ok(resp) if resp.ok() => {
-                                    match resp.json::<DxfUploadResponse>().await {
-                                        Ok(d) => {
-                                            roles.set(
-                                                d.polygons
-                                                    .iter()
-                                                    .map(|p| p.suggested_role)
-                                                    .collect(),
-                                            );
-                                            dxf.set(Some(d));
-                                            error.set(None);
-                                        }
-                                        Err(e) => error.set(Some(format!("Bad response: {e}"))),
-                                    }
-                                }
-                                Ok(resp) => {
-                                    let msg = resp
-                                        .json::<DesignError>()
-                                        .await
-                                        .map(|e| e.message)
-                                        .unwrap_or_else(|_| format!("HTTP {}", resp.status()));
-                                    error.set(Some(msg));
-                                }
-                                Err(e) => error.set(Some(format!("Request failed: {e}"))),
-                            },
-                            Err(e) => error.set(Some(format!("Could not encode request: {e}"))),
+                    // The engine runs here in the browser; the bytes never
+                    // leave the machine.
+                    Ok(bytes) => match engine::dxf::extract(&bytes) {
+                        Ok(d) => {
+                            roles.set(d.polygons.iter().map(|p| p.suggested_role).collect());
+                            dxf.set(Some(d));
+                            error.set(None);
                         }
-                    }
+                        Err(e) => error.set(Some(e.to_string())),
+                    },
                     Err(e) => error.set(Some(format!("Could not read file: {e}"))),
                 }
                 busy.set(false);
@@ -373,29 +346,17 @@ fn designer() -> Html {
             let error = error.clone();
             let busy = busy.clone();
             busy.set(true);
+            // Yield once so the "Generating…" state paints before the engine
+            // takes the thread. Heavy fills still block it; that is what the
+            // Web Worker step of docs/frontend-only-plan.md fixes.
             spawn_local(async move {
-                let resp = Request::post("/api/design")
-                    .json(&req)
-                    .expect("serialize request")
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) if r.ok() => match r.json::<DesignResponse>().await {
-                        Ok(d) => {
-                            error.set(None);
-                            result.set(Some(d));
-                        }
-                        Err(e) => error.set(Some(format!("Bad response: {e}"))),
-                    },
-                    Ok(r) => {
-                        let msg = r
-                            .json::<DesignError>()
-                            .await
-                            .map(|e| e.message)
-                            .unwrap_or_else(|_| format!("HTTP {}", r.status()));
-                        error.set(Some(msg));
+                gloo_timers::future::TimeoutFuture::new(0).await;
+                match engine::generate(&req) {
+                    Ok(d) => {
+                        error.set(None);
+                        result.set(Some(d));
                     }
-                    Err(e) => error.set(Some(format!("Request failed: {e}"))),
+                    Err(e) => error.set(Some(e.to_string())),
                 }
                 busy.set(false);
             });
