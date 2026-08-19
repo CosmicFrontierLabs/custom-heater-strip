@@ -11,15 +11,6 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
-  lint:
-    name: Lint Checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Check migration naming convention
-        run: ./scripts/check-migration-names.sh
-
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -63,12 +54,6 @@ jobs:
         with:
           shared-key: "clippy"
 
-      - name: Install trunk
-        run: cargo install trunk --locked
-
-      - name: Build frontend (required for backend embed)
-        run: cd frontend && trunk build
-
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets
 
@@ -87,12 +72,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "test"
-
-      - name: Install trunk
-        run: cargo install trunk --locked
-
-      - name: Build frontend (required for backend embed)
-        run: cd frontend && trunk build
 
       - name: Run tests
         run: cargo test --workspace

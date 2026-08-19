@@ -1,74 +1,10 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-use ws_bridge::WsEndpoint;
-
-// ---------------------------------------------------------------------------
-// WebSocket endpoint definition — single source of truth for server + client
-// ---------------------------------------------------------------------------
-
-/// The main application WebSocket endpoint.
-pub struct AppSocket;
-
-impl WsEndpoint for AppSocket {
-    const PATH: &'static str = "/ws";
-    type ServerMsg = ServerMsg;
-    type ClientMsg = ClientMsg;
-}
-
-/// Messages sent from the server to the client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ServerMsg {
-    /// Heartbeat to keep connection alive
-    Heartbeat,
-
-    /// Error from server
-    Error { message: String },
-
-    /// Server is shutting down
-    ServerShutdown {
-        reason: String,
-        reconnect_delay_ms: u64,
-    },
-}
-
-/// Messages sent from the client to the server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ClientMsg {
-    /// Ping — server should respond with Heartbeat
-    Ping,
-}
-
-// ---------------------------------------------------------------------------
-// HTTP API types
-// ---------------------------------------------------------------------------
-
-/// Health check response from `/api/health`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthResponse {
-    pub status: String,
-}
-
-/// Example API item (matches the `items` database table).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Item {
-    pub id: Uuid,
-    pub name: String,
-    pub created_at: chrono::NaiveDateTime,
-}
-
-/// Request body for creating a new item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateItemRequest {
-    pub name: String,
-}
 
 // ---------------------------------------------------------------------------
 // Heater design API
 // ---------------------------------------------------------------------------
 
-/// Request body for `POST /api/design`.
+/// Everything the engine needs to design one heater.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesignRequest {
     /// SVG document containing the desired heater outline as its first path.
@@ -247,13 +183,6 @@ pub const FAB_PRESETS: &[FabPreset] = &[
 // DXF geometry API
 // ---------------------------------------------------------------------------
 
-/// Request body for `POST /api/dxf`: an uploaded DXF to extract polygons from.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DxfUploadRequest {
-    /// The DXF file, base64-encoded (handles both ASCII and binary DXF).
-    pub dxf_base64: String,
-}
-
 /// One closed ring pulled out of a DXF, in board mm.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DxfPolygon {
@@ -270,7 +199,7 @@ pub struct DxfPolygon {
     pub suggested_role: PolygonRole,
 }
 
-/// Response body for `POST /api/dxf`.
+/// The polygons pulled out of an uploaded DXF, ready for role assignment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DxfUploadResponse {
     pub polygons: Vec<DxfPolygon>,
@@ -386,7 +315,7 @@ pub struct DesignReport {
     pub warnings: Vec<String>,
 }
 
-/// Response body for `POST /api/design`.
+/// A finished design: preview, fab outputs, and the numbers behind them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesignResponse {
     pub report: DesignReport,
@@ -401,12 +330,6 @@ pub struct DesignResponse {
     pub gerber_zip_base64: String,
 }
 
-/// Error response for a failed design request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DesignError {
-    pub message: String,
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -416,64 +339,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_msg_heartbeat_roundtrip() {
-        let msg = ServerMsg::Heartbeat;
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMsg = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, ServerMsg::Heartbeat));
+    fn design_request_roundtrips_with_geometry() {
+        let req = DesignRequest {
+            geometry: Some(GeometrySpec {
+                outline: None,
+                heaters: vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 5.0]]],
+                tab_in: Some(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+                tab_out: None,
+            }),
+            ..DesignRequest::default()
+        };
+        let parsed: DesignRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).expect("roundtrip");
+        let g = parsed.geometry.expect("geometry survives");
+        assert_eq!(g.heaters.len(), 1);
+        assert_eq!(g.tab_in.unwrap().len(), 3);
+        assert!(g.tab_out.is_none());
+    }
+
+    /// Older payloads have no `geometry` key at all; they must still load and
+    /// take the single-region SVG path rather than failing to deserialise.
+    #[test]
+    fn a_request_without_geometry_defaults_to_none() {
+        let json = r#"{"svg":"<svg/>","voltage":12.0,"watts":10.0,"max_current":2.0,
+                       "copper_oz":0.5,"min_trace_mm":0.15,"min_gap_mm":0.15,
+                       "edge_margin_mm":0.5}"#;
+        let req: DesignRequest = serde_json::from_str(json).expect("defaults apply");
+        assert!(req.geometry.is_none());
+        assert_eq!(req.pad_diameter_mm, default_pad_diameter());
+        assert_eq!(req.fill_kind, FillKind::Serpentine);
     }
 
     #[test]
-    fn server_msg_error_roundtrip() {
-        let msg = ServerMsg::Error {
-            message: "something broke".to_string(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMsg = serde_json::from_str(&json).unwrap();
-        match parsed {
-            ServerMsg::Error { message } => assert_eq!(message, "something broke"),
-            _ => panic!("Wrong variant"),
+    fn role_cycling_visits_every_role_and_returns_to_the_start() {
+        let mut seen = vec![PolygonRole::Unused];
+        let mut r = PolygonRole::Unused;
+        for _ in 0..PolygonRole::ALL.len() {
+            r = r.next();
+            seen.push(r);
+        }
+        // Back where it started after a full lap.
+        assert_eq!(r, PolygonRole::Unused);
+        for role in PolygonRole::ALL {
+            assert!(seen.contains(&role), "{role:?} never appears in the cycle");
         }
     }
 
     #[test]
-    fn server_msg_shutdown_roundtrip() {
-        let msg = ServerMsg::ServerShutdown {
-            reason: "restarting".to_string(),
-            reconnect_delay_ms: 1000,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMsg = serde_json::from_str(&json).unwrap();
-        match parsed {
-            ServerMsg::ServerShutdown {
-                reason,
-                reconnect_delay_ms,
-            } => {
-                assert_eq!(reason, "restarting");
-                assert_eq!(reconnect_delay_ms, 1000);
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn client_msg_ping_roundtrip() {
-        let msg = ClientMsg::Ping;
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ClientMsg = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, ClientMsg::Ping));
-    }
-
-    #[test]
-    fn item_roundtrip() {
-        let item = Item {
-            id: Uuid::new_v4(),
-            name: "test item".to_string(),
-            created_at: chrono::Utc::now().naive_utc(),
-        };
-        let json = serde_json::to_string(&item).unwrap();
-        let parsed: Item = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.id, item.id);
-        assert_eq!(parsed.name, item.name);
+    fn every_role_has_a_distinct_colour() {
+        let mut colours: Vec<&str> = PolygonRole::ALL.iter().map(|r| r.color()).collect();
+        colours.sort_unstable();
+        let n = colours.len();
+        colours.dedup();
+        assert_eq!(colours.len(), n, "two roles share a colour");
     }
 }

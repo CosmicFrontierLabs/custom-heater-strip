@@ -1,49 +1,39 @@
-# CLAUDE.md
+# AGENTS.md
 
-## Crate Recommendations
+## This project has no server
 
-### Static Asset Serving (Web Projects)
+The heater engine is compiled to WebAssembly and runs in the browser; the site
+is static files on GitHub Pages. There is no axum backend, no database, and no
+container. Do not reintroduce one to solve a problem that can be solved in the
+client — see `docs/frontend-only-plan.md` for why, and for what it would cost
+to reverse.
 
-Use **`memory-serve`** for embedding and serving static frontend assets in axum web servers.
+Consequences worth knowing before you reach for a crate:
 
-- Pre-compresses assets (brotli/gzip) at build time, zero CPU at startup
-- Built-in content negotiation, ETag/304, cache-control headers, SPA fallback
-- Replaces `rust-embed` + manual compression entirely
+- **No static-asset-serving crate is needed.** Earlier guidance here
+  recommended `memory-serve` for embedding assets in an axum server. That is
+  obsolete: pre-compression, ETag negotiation and cache-control headers are
+  server features, and Pages provides its own (gzip only, no brotli).
+- **No response headers can be set.** GitHub Pages cannot send `COOP`/`COEP`,
+  so `SharedArrayBuffer` and wasm threads are permanently unavailable. Web
+  Workers communicating by `postMessage` are fine; anything needing
+  `rayon`-style parallelism in wasm is not.
+- **Everything must cross-compile to `wasm32-unknown-unknown`.** Check a new
+  dependency with `cargo build -p engine --target wasm32-unknown-unknown`
+  before designing around it, and weigh its bundle cost — first load is
+  currently ~858 KB gzipped.
 
-**Setup:**
+## Bundle size
 
-```toml
-[dependencies]
-memory-serve = "2.1"
+Measure with `cd frontend && trunk build --release`, then gzip the `.wasm`.
+`wasm-opt -Oz` already runs (via `data-wasm-opt="z"` in `index.html`), so the
+built artifact is the real number. Beware measuring a size while the code path
+you care about is dead — the linker will strip it and flatter you.
 
-[build-dependencies]
-memory-serve = "2.1"
-```
+## Testing
 
-```rust
-// build.rs
-fn main() {
-    memory_serve::load_directory("./frontend/dist");
-}
-```
-
-```rust
-// main.rs
-use memory_serve::CacheControl;
-
-let frontend = memory_serve::load!()
-    .index_file(Some("/index.html"))
-    .fallback(Some("/index.html"))
-    .fallback_status(axum::http::StatusCode::OK)
-    .html_cache_control(CacheControl::NoCache)
-    .cache_control(CacheControl::Long)
-    .into_router();
-
-let app = Router::new()
-    // API routes first
-    .route("/api/health", get(|| async { "ok" }))
-    .with_state(app_state)
-    .merge(frontend);
-```
-
-Note: memory-serve 2.x requires axum 0.8+. For axum 0.7, use memory-serve 0.6.0 (older `load_assets!` macro API).
+`cargo test --workspace` covers the engine. For anything that only manifests in
+a browser — wasm failing to initialise, an exception during mount, a click
+handler that does the wrong thing — use `scripts/browser_drive.py`, which
+drives the app over CDP and reports console errors and page exceptions that a
+screenshot would hide.

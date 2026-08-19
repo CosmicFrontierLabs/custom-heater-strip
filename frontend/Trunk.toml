@@ -1,2 +1,4 @@
 [build]
+# Overridden to "/<repo>/" by the Pages workflow; "/" keeps `trunk serve` and
+# any root-served deployment working locally.
 public_url = "/"
