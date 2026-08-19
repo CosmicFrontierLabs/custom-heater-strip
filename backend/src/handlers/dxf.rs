@@ -35,17 +35,9 @@ pub async fn dxf(
     }
 
     // Parsing and tessellation are CPU-bound; keep them off the reactor.
-    let parsed = tokio::task::spawn_blocking(move || {
-        let mut warnings = Vec::new();
-        let units = engine::dxf::units_label(&bytes);
-        engine::dxf::parse(&bytes, &mut warnings).map(|polygons| DxfUploadResponse {
-            polygons,
-            units,
-            warnings,
-        })
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let parsed = tokio::task::spawn_blocking(move || engine::dxf::extract(&bytes))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     parsed
         .map(Json)
