@@ -7,9 +7,13 @@
 
 use std::fmt::Write;
 
+use crate::terminals::Pad;
 use crate::Design;
 
 const BOARD_VERSION: &str = "20240108"; // KiCad 8 file format
+
+/// Soldermask relief around each pad, mm. Matches the Gerber writer.
+const MASK_GROW_MM: f64 = 0.05;
 
 pub fn render(design: &Design) -> String {
     let mut s = String::new();
@@ -52,18 +56,35 @@ pub fn render(design: &Design) -> String {
         );
     }
 
-    // Rectangular terminal pads as filled graphics on F.Cu, with matching
-    // mask openings.
-    for p in &design.pads {
-        for (layer, grow) in [("F.Cu", 0.0), ("F.Mask", 0.05)] {
-            let _ = writeln!(
-                s,
-                "  (gr_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.01) (type solid)) (fill yes) (layer \"{layer}\"))",
-                p.cx - p.w / 2.0 - grow,
-                p.cy - p.h / 2.0 - grow,
-                p.cx + p.w / 2.0 + grow,
-                p.cy + p.h / 2.0 + grow
-            );
+    // Terminal pads as filled graphics on F.Cu, with matching mask openings.
+    // Rectangles stay `gr_rect` for readability in the KiCad editor;
+    // DXF-shaped tabs become `gr_poly`.
+    for pad in &design.pads {
+        for (layer, grow) in [("F.Cu", 0.0), ("F.Mask", MASK_GROW_MM)] {
+            match pad {
+                Pad::Rect(r) => {
+                    let g = r.grown(grow);
+                    let _ = writeln!(
+                        s,
+                        "  (gr_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.01) (type solid)) (fill yes) (layer \"{layer}\"))",
+                        g.cx - g.w / 2.0,
+                        g.cy - g.h / 2.0,
+                        g.cx + g.w / 2.0,
+                        g.cy + g.h / 2.0
+                    );
+                }
+                Pad::Poly(_) => {
+                    let pts = pad.grown_ring(grow);
+                    let _ = write!(s, "  (gr_poly (pts");
+                    for p in &pts {
+                        let _ = write!(s, " (xy {:.4} {:.4})", p.x, p.y);
+                    }
+                    let _ = writeln!(
+                        s,
+                        ") (stroke (width 0.01) (type solid)) (fill yes) (layer \"{layer}\"))"
+                    );
+                }
+            }
         }
     }
 

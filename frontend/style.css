@@ -85,3 +85,31 @@ h1 {
 .slider-field { display: block; margin-top: 0.5rem; }
 .slider-field input[type="range"] { width: 100%; max-width: 24rem; accent-color: #e94560; }
 .dl-label { color: #9aa0b8; font-size: 0.85rem; }
+
+/* --- DXF polygon picker --- */
+.picker {
+    width: 100%;
+    max-height: 60vh;
+    background: #0f1830;
+    border: 1px solid #2a3a5e;
+    border-radius: 6px;
+    margin: 0.5rem 0;
+}
+/* Every ring is a click target, so say so and give hover feedback. */
+.picker path { cursor: pointer; }
+.picker path:hover { fill-opacity: 0.55; }
+.legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1rem;
+    margin: 0.5rem 0;
+    font-size: 0.8rem;
+    color: #9aa0b8;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 0.35rem; }
+.swatch {
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 2px;
+    display: inline-block;
+}

@@ -13,6 +13,8 @@ use shared::{CornerStyle, FillKind};
 
 use crate::{outline::Polygon, EngineError, PathSeg};
 
+pub use offset::reverse_path;
+
 /// The area reserved for the terminals. The fill stays dense: only rows
 /// crossing the pocket's y-band give way to the pads; everywhere else the
 /// pattern may run as far left as `lane_edge` (a thin corridor for the
@@ -29,9 +31,10 @@ pub struct Reserve {
 }
 
 impl Reserve {
-    /// No reservation at all (used by pattern unit tests).
-    #[cfg(test)]
-    pub(crate) fn none() -> Self {
+    /// No reservation at all: the pattern may use the whole polygon. Used by
+    /// multi-region routing, where tab keepouts are cut out of the region
+    /// beforehand rather than reserved during the fill.
+    pub fn none() -> Self {
         Reserve {
             lane_edge: f64::NEG_INFINITY,
             pocket_x1: f64::NEG_INFINITY,
@@ -71,27 +74,60 @@ impl Reserve {
     }
 }
 
-/// Route the heater trace with the requested pattern.
+/// Where a pattern should leave its two path ends relative to each other.
 ///
-/// `pitch_mm` is the centerline-to-centerline spacing and `inset_mm` the
-/// clearance from the outline (edge margin + half trace width).
-pub fn fill(
-    kind: FillKind,
-    outline: &Polygon,
-    pitch_mm: f64,
-    inset_mm: f64,
-    reserve: Reserve,
-    style: CornerStyle,
-    warnings: &mut Vec<String>,
-) -> Result<Vec<PathSeg>, EngineError> {
+/// A lone heater wants both ends together, next to the pad pocket. A region
+/// in the middle of a series chain wants them at opposite ends, so the run
+/// coming in and the run going out do not have to cross the fill to reach
+/// their neighbours.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Terminals {
+    /// Both ends on the same side.
+    #[default]
+    SameSide,
+    /// Ends on opposite sides. Only the plain serpentine can honour this;
+    /// other patterns ignore it, and the caller warns if that costs a
+    /// crossing.
+    OppositeSides,
+}
+
+/// One fill request: which pattern, over what polygon, at what spacing.
+pub struct FillSpec<'a> {
+    pub kind: FillKind,
+    pub outline: &'a Polygon,
+    /// Centerline-to-centerline spacing.
+    pub pitch_mm: f64,
+    /// Clearance from the outline (edge margin + half trace width).
+    pub inset_mm: f64,
+    pub reserve: Reserve,
+    pub style: CornerStyle,
+    pub terminals: Terminals,
+}
+
+/// Route the heater trace with the requested pattern.
+pub fn fill(spec: FillSpec<'_>, warnings: &mut Vec<String>) -> Result<Vec<PathSeg>, EngineError> {
+    let FillSpec {
+        kind,
+        outline,
+        pitch_mm,
+        inset_mm,
+        reserve,
+        style,
+        terminals,
+    } = spec;
     match kind {
+        // Row count parity decides which side the last row ends on: an even
+        // number of rows returns to the starting side, an odd number crosses.
         FillKind::Serpentine => serpentine::fill(
             outline,
             pitch_mm,
             inset_mm,
             reserve,
             style,
-            serpentine::RowParity::Even,
+            match terminals {
+                Terminals::SameSide => serpentine::RowParity::Even,
+                Terminals::OppositeSides => serpentine::RowParity::Odd,
+            },
             warnings,
         ),
         FillKind::WavySerpentine => {

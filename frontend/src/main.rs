@@ -1,9 +1,24 @@
+use base64::Engine as _;
 use gloo_net::http::Request;
-use shared::{DesignError, DesignRequest, DesignResponse};
+use shared::{
+    DesignError, DesignRequest, DesignResponse, DxfPolygon, DxfUploadRequest, DxfUploadResponse,
+    GeometrySpec, PolygonRole,
+};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
+
+/// Where the board geometry comes from.
+#[derive(Clone, Copy, PartialEq)]
+enum GeometryMode {
+    /// Upload an SVG whose largest closed path is the outline.
+    Svg,
+    /// Synthesise a rectangle client-side.
+    Rect,
+    /// Upload a DXF and assign roles to its polygons.
+    Dxf,
+}
 
 #[derive(Clone, Routable, PartialEq)]
 enum Route {
@@ -63,6 +78,107 @@ fn num_field(props: &NumFieldProps) -> Html {
     }
 }
 
+/// Interactive plan view of an uploaded DXF: click a polygon to cycle what it
+/// is used for.
+#[derive(Properties, PartialEq)]
+struct PickerProps {
+    polygons: Vec<DxfPolygon>,
+    roles: Vec<PolygonRole>,
+    on_pick: Callback<usize>,
+}
+
+#[function_component(PolygonPicker)]
+fn polygon_picker(props: &PickerProps) -> Html {
+    // Frame the whole drawing with a small margin.
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in props.polygons.iter().flat_map(|p| p.points.iter()) {
+        min_x = min_x.min(p[0]);
+        min_y = min_y.min(p[1]);
+        max_x = max_x.max(p[0]);
+        max_y = max_y.max(p[1]);
+    }
+    if !min_x.is_finite() {
+        return html! {};
+    }
+    let margin = ((max_x - min_x).max(max_y - min_y) * 0.03).max(1.0);
+    let (vx, vy) = (min_x - margin, min_y - margin);
+    let (vw, vh) = (max_x - min_x + 2.0 * margin, max_y - min_y + 2.0 * margin);
+    // Keep hairlines visible whatever the board's real size.
+    let stroke = (vw.max(vh) / 400.0).max(0.05);
+
+    html! {
+        <svg class="picker" viewBox={format!("{vx:.3} {vy:.3} {vw:.3} {vh:.3}")}
+             xmlns="http://www.w3.org/2000/svg">
+            // Polygons arrive largest-first, so painting in order puts small
+            // tabs on top of the regions containing them — and therefore
+            // makes them the ones that receive the click.
+            { for props.polygons.iter().enumerate().map(|(i, poly)| {
+                let role = props.roles.get(i).copied().unwrap_or_default();
+                let on_pick = props.on_pick.clone();
+                let onclick = Callback::from(move |_: MouseEvent| on_pick.emit(i));
+                let used = role != PolygonRole::Unused;
+                html! {
+                    <path key={poly.id}
+                          d={ring_d(&poly.points)}
+                          fill={role.color()}
+                          fill-opacity={if used { "0.35" } else { "0.08" }}
+                          stroke={role.color()}
+                          stroke-width={format!("{:.4}", if used { stroke * 2.0 } else { stroke })}
+                          stroke-dasharray={if used { "none".to_string() } else { format!("{:.3} {:.3}", stroke * 4.0, stroke * 3.0) }}
+                          onclick={onclick}>
+                        <title>{ format!("{} · {} · {:.1} mm² — click to change",
+                                         poly.layer, poly.kind, poly.area_mm2) }</title>
+                    </path>
+                }
+            }) }
+        </svg>
+    }
+}
+
+/// Closed SVG `d` string for a ring.
+fn ring_d(points: &[[f64; 2]]) -> String {
+    let mut d = String::with_capacity(points.len() * 18);
+    for (i, p) in points.iter().enumerate() {
+        d.push(if i == 0 { 'M' } else { 'L' });
+        d.push_str(&format!("{:.4} {:.4}", p[0], p[1]));
+    }
+    d.push('Z');
+    d
+}
+
+/// Roles that only one polygon may hold at a time.
+fn is_singular(role: PolygonRole) -> bool {
+    matches!(
+        role,
+        PolygonRole::TabIn | PolygonRole::TabOut | PolygonRole::Outline
+    )
+}
+
+/// Turn the role assignment into engine geometry, or explain what is missing.
+fn build_geometry(polygons: &[DxfPolygon], roles: &[PolygonRole]) -> Result<GeometrySpec, String> {
+    let mut spec = GeometrySpec::default();
+    for (poly, role) in polygons.iter().zip(roles.iter()) {
+        let ring = poly.points.clone();
+        match role {
+            PolygonRole::Heater => spec.heaters.push(ring),
+            PolygonRole::TabIn => spec.tab_in = Some(ring),
+            PolygonRole::TabOut => spec.tab_out = Some(ring),
+            PolygonRole::Outline => spec.outline = Some(ring),
+            PolygonRole::Unused => {}
+        }
+    }
+    if spec.heaters.is_empty() {
+        return Err("Click at least one polygon to mark it as a heater region.".into());
+    }
+    match (&spec.tab_in, &spec.tab_out) {
+        (Some(_), Some(_)) => Ok(spec),
+        (None, Some(_)) => Err("Mark a polygon as the input solder tab.".into()),
+        (Some(_), None) => Err("Mark a polygon as the output solder tab.".into()),
+        (None, None) => Err("Mark two polygons as the input and output solder tabs.".into()),
+    }
+}
+
 #[function_component(Designer)]
 fn designer() -> Html {
     let svg_text = use_state(|| None::<(String, String)>); // (filename, contents)
@@ -78,10 +194,13 @@ fn designer() -> Html {
     let fill_kind = use_state(shared::FillKind::default);
     // Fab process floor for the trace-width slider; set by the preset picker.
     let fab_floor = use_state(|| 0.05_f64);
-    // Outline source: uploaded SVG or a parametric rectangle.
-    let rect_mode = use_state(|| false);
+    // Where the geometry comes from: SVG upload, parametric rectangle, or a
+    // DXF whose polygons the user tags by role.
+    let mode = use_state(|| GeometryMode::Svg);
     let rect_w = use_state(|| 100.0_f64);
     let rect_h = use_state(|| 20.0_f64);
+    let dxf = use_state(|| None::<DxfUploadResponse>);
+    let roles = use_state(Vec::<PolygonRole>::new);
     let result = use_state(|| None::<DesignResponse>);
     let error = use_state(|| None::<String>);
     let busy = use_state(|| false);
@@ -106,6 +225,84 @@ fn designer() -> Html {
         })
     };
 
+    // DXF upload: parse server-side, then seed each polygon's role from the
+    // layer-name guess so a conventionally-named file arrives ready to go.
+    let on_dxf_file = {
+        let (dxf, roles, error, busy) = (dxf.clone(), roles.clone(), error.clone(), busy.clone());
+        Callback::from(move |e: Event| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            let Some(file) = input.files().and_then(|fs| fs.get(0)) else {
+                return;
+            };
+            let (dxf, roles, error, busy) =
+                (dxf.clone(), roles.clone(), error.clone(), busy.clone());
+            busy.set(true);
+            spawn_local(async move {
+                match gloo_file::futures::read_as_bytes(&gloo_file::File::from(file)).await {
+                    Ok(bytes) => {
+                        let req = DxfUploadRequest {
+                            dxf_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        };
+                        match Request::post("/api/dxf").json(&req) {
+                            Ok(r) => match r.send().await {
+                                Ok(resp) if resp.ok() => {
+                                    match resp.json::<DxfUploadResponse>().await {
+                                        Ok(d) => {
+                                            roles.set(
+                                                d.polygons
+                                                    .iter()
+                                                    .map(|p| p.suggested_role)
+                                                    .collect(),
+                                            );
+                                            dxf.set(Some(d));
+                                            error.set(None);
+                                        }
+                                        Err(e) => error.set(Some(format!("Bad response: {e}"))),
+                                    }
+                                }
+                                Ok(resp) => {
+                                    let msg = resp
+                                        .json::<DesignError>()
+                                        .await
+                                        .map(|e| e.message)
+                                        .unwrap_or_else(|_| format!("HTTP {}", resp.status()));
+                                    error.set(Some(msg));
+                                }
+                                Err(e) => error.set(Some(format!("Request failed: {e}"))),
+                            },
+                            Err(e) => error.set(Some(format!("Could not encode request: {e}"))),
+                        }
+                    }
+                    Err(e) => error.set(Some(format!("Could not read file: {e}"))),
+                }
+                busy.set(false);
+            });
+        })
+    };
+
+    // Clicking a polygon advances its role. The tab and outline roles are
+    // singular, so taking one clears whoever held it before — that way the
+    // selection is always valid by construction.
+    let on_pick = {
+        let roles = roles.clone();
+        Callback::from(move |i: usize| {
+            let mut next = (*roles).clone();
+            if i >= next.len() {
+                return;
+            }
+            let assigned = next[i].next();
+            if is_singular(assigned) {
+                for (j, r) in next.iter_mut().enumerate() {
+                    if j != i && *r == assigned {
+                        *r = PolygonRole::Unused;
+                    }
+                }
+            }
+            next[i] = assigned;
+            roles.set(next);
+        })
+    };
+
     let on_generate = {
         let svg_text = svg_text.clone();
         let (voltage, watts, max_current) = (voltage.clone(), watts.clone(), max_current.clone());
@@ -120,23 +317,42 @@ fn designer() -> Html {
             corner_style.clone(),
             fill_kind.clone(),
         );
-        let (rect_mode, rect_w, rect_h) = (rect_mode.clone(), rect_w.clone(), rect_h.clone());
+        let (mode, rect_w, rect_h) = (mode.clone(), rect_w.clone(), rect_h.clone());
+        let (dxf, roles) = (dxf.clone(), roles.clone());
         let result = result.clone();
         let error = error.clone();
         let busy = busy.clone();
         Callback::from(move |_: MouseEvent| {
-            let svg = if *rect_mode {
-                let (w, h) = (*rect_w, *rect_h);
-                format!(
-                    r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}"/></svg>"##
-                )
-            } else {
-                match (*svg_text).clone() {
+            // In DXF mode the polygon roles carry the geometry and `svg` goes
+            // unused; the other two modes supply an outline the engine parses.
+            let mut geometry = None;
+            let svg = match *mode {
+                GeometryMode::Rect => {
+                    let (w, h) = (*rect_w, *rect_h);
+                    format!(
+                        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}"/></svg>"##
+                    )
+                }
+                GeometryMode::Svg => match (*svg_text).clone() {
                     Some((_, svg)) => svg,
                     None => {
                         error.set(Some("Upload an SVG outline first.".into()));
                         return;
                     }
+                },
+                GeometryMode::Dxf => {
+                    let Some(parsed) = (*dxf).clone() else {
+                        error.set(Some("Upload a DXF first.".into()));
+                        return;
+                    };
+                    match build_geometry(&parsed.polygons, &roles) {
+                        Ok(spec) => geometry = Some(spec),
+                        Err(msg) => {
+                            error.set(Some(msg));
+                            return;
+                        }
+                    }
+                    String::new()
                 }
             };
             let req = DesignRequest {
@@ -151,6 +367,7 @@ fn designer() -> Html {
                 pad_diameter_mm: *pad_diameter,
                 corner_style: *corner_style,
                 fill_kind: *fill_kind,
+                geometry,
             };
             let result = result.clone();
             let error = error.clone();
@@ -244,9 +461,9 @@ fn designer() -> Html {
         })
     };
 
-    let set_rect_mode = |to: bool| {
-        let rect_mode = rect_mode.clone();
-        Callback::from(move |_: Event| rect_mode.set(to))
+    let set_mode = |to: GeometryMode| {
+        let mode = mode.clone();
+        Callback::from(move |_: Event| mode.set(to))
     };
 
     html! {
@@ -255,37 +472,89 @@ fn designer() -> Html {
             <p class="tagline">{ "Upload a flex outline, set your electrical budget, get a fab-ready serpentine heater." }</p>
 
             <div class="panel">
-                <h2>{ "1 · Outline" }</h2>
+                <h2>{ "1 · Geometry" }</h2>
                 <div class="mode-row">
-                    <label>
-                        <input type="radio" name="outline-mode" checked={!*rect_mode}
-                               onchange={set_rect_mode(false)} />
-                        { " Upload SVG" }
-                    </label>
-                    <label>
-                        <input type="radio" name="outline-mode" checked={*rect_mode}
-                               onchange={set_rect_mode(true)} />
-                        { " Rectangle" }
-                    </label>
+                    { for [
+                        (GeometryMode::Svg, "Upload SVG"),
+                        (GeometryMode::Rect, "Rectangle"),
+                        (GeometryMode::Dxf, "Upload DXF"),
+                    ].into_iter().map(|(m, label)| html! {
+                        <label>
+                            <input type="radio" name="geometry-mode" checked={*mode == m}
+                                   onchange={set_mode(m)} />
+                            { format!(" {label}") }
+                        </label>
+                    }) }
                 </div>
-                { if *rect_mode { html! {
-                    <div class="fields">
-                        <NumField label="Width" unit="mm" value={*rect_w} step={1.0}
-                            onchange={let v = rect_w.clone(); Callback::from(move |x| v.set(x))} />
-                        <NumField label="Height" unit="mm" value={*rect_h} step={1.0}
-                            onchange={let v = rect_h.clone(); Callback::from(move |x| v.set(x))} />
-                    </div>
-                } } else { html! {
-                    <>
-                        <input type="file" accept=".svg,image/svg+xml" onchange={on_file} />
-                        { match (*svg_text).as_ref() {
-                            Some((name, text)) => html! {
-                                <span class="file-ok">{ format!("{name} ({} bytes)", text.len()) }</span>
-                            },
-                            None => html! { <span class="file-hint">{ "SVG with a closed path, sized in mm" }</span> },
-                        }}
-                    </>
-                } } }
+                { match *mode {
+                    GeometryMode::Rect => html! {
+                        <div class="fields">
+                            <NumField label="Width" unit="mm" value={*rect_w} step={1.0}
+                                onchange={let v = rect_w.clone(); Callback::from(move |x| v.set(x))} />
+                            <NumField label="Height" unit="mm" value={*rect_h} step={1.0}
+                                onchange={let v = rect_h.clone(); Callback::from(move |x| v.set(x))} />
+                        </div>
+                    },
+                    GeometryMode::Svg => html! {
+                        <>
+                            <input type="file" accept=".svg,image/svg+xml" onchange={on_file} />
+                            { match (*svg_text).as_ref() {
+                                Some((name, text)) => html! {
+                                    <span class="file-ok">{ format!("{name} ({} bytes)", text.len()) }</span>
+                                },
+                                None => html! { <span class="file-hint">{ "SVG with a closed path, sized in mm" }</span> },
+                            }}
+                        </>
+                    },
+                    GeometryMode::Dxf => html! {
+                        <>
+                            <input type="file" accept=".dxf" onchange={on_dxf_file} />
+                            { match (*dxf).as_ref() {
+                                None => html! {
+                                    <span class="file-hint">
+                                        { "DXF with closed outlines — polylines, circles, ellipses" }
+                                    </span>
+                                },
+                                Some(parsed) => html! {
+                                    <>
+                                        <span class="file-ok">
+                                            { format!("{} polygon{} · units: {}",
+                                                      parsed.polygons.len(),
+                                                      if parsed.polygons.len() == 1 { "" } else { "s" },
+                                                      parsed.units) }
+                                        </span>
+                                        { for parsed.warnings.iter().map(|w| html! {
+                                            <div class="warning">{ w }</div>
+                                        }) }
+                                        <p class="field-label">
+                                            { "Click a polygon to change what it is used for." }
+                                        </p>
+                                        <div class="legend">
+                                            { for PolygonRole::ALL.iter().map(|r| {
+                                                let n = roles.iter().filter(|x| *x == r).count();
+                                                html! {
+                                                    <span class="legend-item">
+                                                        <span class="swatch"
+                                                              style={format!("background:{}", r.color())} />
+                                                        { format!("{} ({n})", r.label()) }
+                                                    </span>
+                                                }
+                                            }) }
+                                        </div>
+                                        <PolygonPicker
+                                            polygons={parsed.polygons.clone()}
+                                            roles={(*roles).clone()}
+                                            on_pick={on_pick.clone()} />
+                                        { match build_geometry(&parsed.polygons, &roles) {
+                                            Ok(_) => html!{},
+                                            Err(msg) => html! { <div class="warning">{ msg }</div> },
+                                        }}
+                                    </>
+                                },
+                            }}
+                        </>
+                    },
+                } }
             </div>
 
             <div class="panel">
