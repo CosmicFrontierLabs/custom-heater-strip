@@ -57,6 +57,9 @@ pub fn extract(bytes: &[u8]) -> Result<DxfUploadResponse, EngineError> {
     // drawing's overall extent, which we only know after reading everything.
     let mut raw: Vec<(String, String, Vec<Point>)> = Vec::new();
     let mut skipped_open = 0usize;
+    // Bare LINE segments, gathered to be stitched into rings afterwards.
+    let mut loose: Vec<(String, Point, Point)> = Vec::new();
+    let (mut z_lo, mut z_hi) = (f64::INFINITY, f64::NEG_INFINITY);
 
     for entity in drawing.entities() {
         let layer = entity.common.layer.clone();
@@ -124,11 +127,37 @@ pub fn extract(bytes: &[u8]) -> Result<DxfUploadResponse, EngineError> {
                 }
                 ("SPLINE", pts)
             }
+            // A bare LINE is not a ring by itself, but a great many exports
+            // are nothing but LINEs — an outline drawn as separate segments.
+            // Gather them and try to stitch rings out of them below.
+            EntityType::Line(l) => {
+                z_lo = z_lo.min(l.p1.z).min(l.p2.z);
+                z_hi = z_hi.max(l.p1.z).max(l.p2.z);
+                loose.push((
+                    layer,
+                    Point::new(l.p1.x, l.p1.y),
+                    Point::new(l.p2.x, l.p2.y),
+                ));
+                continue;
+            }
             _ => continue,
         };
 
         if ring.len() >= 3 {
             raw.push((layer, kind.to_string(), ring));
+        }
+    }
+
+    if !loose.is_empty() {
+        if z_hi - z_lo > 1e-9 {
+            warnings.push(format!(
+                "the line work spans {:.3} in z, so this is a 3D drawing; only \
+                 its flat xy projection can be used as a board outline",
+                z_hi - z_lo
+            ));
+        }
+        for (layer, ring) in stitch_lines(&loose, warnings) {
+            raw.push((layer, "LINES".to_string(), ring));
         }
     }
 
@@ -144,16 +173,16 @@ pub fn extract(bytes: &[u8]) -> Result<DxfUploadResponse, EngineError> {
     }
 
     // Drawing extent in DXF units, for the flip + translate.
-    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
-    let mut max_y = f64::NEG_INFINITY;
+    let (mut min_x, mut min_y_extent) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
     for (_, _, ring) in &raw {
         for p in ring {
             min_x = min_x.min(p.x);
-            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            min_y_extent = min_y_extent.min(p.y);
             max_y = max_y.max(p.y);
         }
     }
-    let _ = min_y;
 
     let mut out = Vec::new();
     let mut tiny = 0usize;
@@ -186,7 +215,31 @@ pub fn extract(bytes: &[u8]) -> Result<DxfUploadResponse, EngineError> {
         ));
     }
     if out.is_empty() {
+        // Everything was found and then thrown away for being minute, which
+        // almost always means the file is in metres or inches and said nothing
+        // about it. Saying "no closed rings" would send the user looking for
+        // the wrong problem entirely.
+        if tiny > 0 {
+            let (w, h) = ((max_x - min_x) * scale, (max_y - min_y_extent) * scale);
+            let guess = unit_hint(w, h)
+                .map(|h| format!(" Or {h}."))
+                .unwrap_or_default();
+            return Err(EngineError::DxfParse(format!(
+                "found {tiny} closed outline(s), but at the {units_label} units \
+                 this drawing declares it is only {w:.3} × {h:.3} mm — too small \
+                 to be a board.{guess}"
+            )));
+        }
         return Err(EngineError::NoDxfPolygons);
+    }
+
+    let (draw_w, draw_h) = ((max_x - min_x) * scale, (max_y - min_y_extent) * scale);
+    if draw_w.max(draw_h) < 5.0 {
+        if let Some(hint) = unit_hint(draw_w, draw_h) {
+            warnings.push(format!(
+                "the whole drawing is only {draw_w:.3} × {draw_h:.3} mm; {hint}"
+            ));
+        }
     }
 
     // Largest first: the board outline and the big heater regions land at the
@@ -200,6 +253,53 @@ pub fn extract(bytes: &[u8]) -> Result<DxfUploadResponse, EngineError> {
         units: units_label,
         warnings: std::mem::take(warnings),
     })
+}
+
+/// If a drawing is implausibly small, name the unit that would make it
+/// plausible. A file that forgot `$INSUNITS` but was drawn in metres reads as
+/// a fraction of a millimetre, and "too small" on its own sends the user
+/// looking for the wrong problem.
+fn unit_hint(w_mm: f64, h_mm: f64) -> Option<String> {
+    [("metres", 1000.0), ("inches", 25.4), ("centimetres", 10.0)]
+        .into_iter()
+        .find(|(_, f)| (5.0..=500.0).contains(&(w_mm * f).max(h_mm * f)))
+        .map(|(unit, f)| {
+            format!(
+                "drawn in {unit} it would be {:.1} × {:.1} mm, which looks right \
+                 — set $INSUNITS accordingly and re-export",
+                w_mm * f,
+                h_mm * f
+            )
+        })
+}
+
+/// Turn bare `LINE` segments into closed composite polygons.
+///
+/// Plenty of exporters emit an outline as a pile of disconnected segments
+/// rather than a polyline, and flattened 3D models add crossings, exact
+/// duplicates and interior facet edges on top. All of that is handed to
+/// [`crate::arrangement`], which splits the segments at their crossings and
+/// traces the boundary of each connected piece.
+fn stitch_lines(
+    loose: &[(String, Point, Point)],
+    warnings: &mut Vec<String>,
+) -> Vec<(String, Vec<Point>)> {
+    let segments: Vec<(Point, Point)> = loose.iter().map(|(_, a, b)| (*a, *b)).collect();
+    let pieces = crate::arrangement::compose(&segments, warnings);
+    if pieces.is_empty() {
+        return Vec::new();
+    }
+    warnings.push(format!(
+        "composed {} closed outline(s) from {} loose line segment(s)",
+        pieces.len(),
+        loose.len()
+    ));
+    // Loose lines carry no meaningful shared layer, so label by the commonest.
+    let layer = loose.first().map(|(l, _, _)| l.clone()).unwrap_or_default();
+    pieces
+        .into_iter()
+        .map(|p| (layer.clone(), p.ring))
+        .collect()
 }
 
 /// Seed a role from the layer name so conventionally-named files come in
@@ -421,6 +521,94 @@ mod tests {
         }
         .area_mm2();
         assert!((area - 78.54).abs() < 0.5, "{area}");
+    }
+
+    /// A square drawn as four separate LINE entities, the way many exporters
+    /// emit an outline. Before the arrangement went in, this parsed to nothing.
+    #[test]
+    fn a_square_of_loose_lines_is_composed_into_a_ring() {
+        let mut s = String::from("0\nSECTION\n2\nHEADER\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n");
+        s.push_str("0\nSECTION\n2\nENTITIES\n");
+        let corners = [(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)];
+        for i in 0..4 {
+            let (x0, y0) = corners[i];
+            let (x1, y1) = corners[(i + 1) % 4];
+            s.push_str(&format!(
+                "0\nLINE\n8\nOUTLINE\n10\n{x0}\n20\n{y0}\n30\n0.0\n11\n{x1}\n21\n{y1}\n31\n0.0\n"
+            ));
+        }
+        s.push_str("0\nENDSEC\n0\nEOF\n");
+
+        let mut w = Vec::new();
+        let polys = parse(s.as_bytes(), &mut w).unwrap();
+        assert_eq!(polys.len(), 1, "{polys:#?}");
+        assert_eq!(polys[0].kind, "LINES");
+        assert!(
+            (polys[0].area_mm2 - 1200.0).abs() < 1e-6,
+            "{}",
+            polys[0].area_mm2
+        );
+        assert!(
+            w.iter().any(|m| m.contains("composed 1 closed outline")),
+            "{w:?}"
+        );
+    }
+
+    /// A flattened extrusion: the same square top and bottom, joined by
+    /// verticals that collapse to points when projected. It must still yield
+    /// exactly one ring, not two stacked ones.
+    #[test]
+    fn a_flattened_extrusion_collapses_to_one_ring() {
+        let mut s = String::from("0\nSECTION\n2\nHEADER\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n");
+        s.push_str("0\nSECTION\n2\nENTITIES\n");
+        let corners = [(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)];
+        for z in [0.0, 12.0] {
+            for i in 0..4 {
+                let (x0, y0) = corners[i];
+                let (x1, y1) = corners[(i + 1) % 4];
+                s.push_str(&format!(
+                    "0\nLINE\n8\nBOX\n10\n{x0}\n20\n{y0}\n30\n{z}\n11\n{x1}\n21\n{y1}\n31\n{z}\n"
+                ));
+            }
+        }
+        for (x, y) in corners {
+            s.push_str(&format!(
+                "0\nLINE\n8\nBOX\n10\n{x}\n20\n{y}\n30\n0.0\n11\n{x}\n21\n{y}\n31\n12.0\n"
+            ));
+        }
+        s.push_str("0\nENDSEC\n0\nEOF\n");
+
+        let mut w = Vec::new();
+        let polys = parse(s.as_bytes(), &mut w).unwrap();
+        assert_eq!(polys.len(), 1, "{polys:#?}");
+        assert!(
+            (polys[0].area_mm2 - 1200.0).abs() < 1e-6,
+            "{}",
+            polys[0].area_mm2
+        );
+        assert!(w.iter().any(|m| m.contains("3D drawing")), "{w:?}");
+    }
+
+    /// A drawing in metres with no `$INSUNITS` reads as a fraction of a
+    /// millimetre. Saying "no closed rings" would be actively misleading, so
+    /// the error names the unit that would make it plausible.
+    #[test]
+    fn a_metre_scale_drawing_is_diagnosed_not_dismissed() {
+        let mut s = String::from("0\nSECTION\n2\nENTITIES\n");
+        let corners = [(0.0, 0.0), (0.1, 0.0), (0.1, 0.08), (0.0, 0.08)];
+        for i in 0..4 {
+            let (x0, y0) = corners[i];
+            let (x1, y1) = corners[(i + 1) % 4];
+            s.push_str(&format!(
+                "0\nLINE\n8\nM\n10\n{x0}\n20\n{y0}\n30\n0.0\n11\n{x1}\n21\n{y1}\n31\n0.0\n"
+            ));
+        }
+        s.push_str("0\nENDSEC\n0\nEOF\n");
+
+        let err = parse(s.as_bytes(), &mut Vec::new()).expect_err("too small");
+        let msg = err.to_string();
+        assert!(msg.contains("too small to be a board"), "{msg}");
+        assert!(msg.contains("metres"), "{msg}");
     }
 
     #[test]

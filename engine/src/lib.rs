@@ -5,6 +5,7 @@
 //! requested power, along with fab outputs: KiCad board, Gerbers, SVG preview,
 //! and a numeric design report.
 
+mod arrangement;
 pub mod dxf;
 mod fills;
 pub mod geom;
