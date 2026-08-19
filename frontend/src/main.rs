@@ -151,6 +151,9 @@ fn designer() -> Html {
                 pad_diameter_mm: *pad_diameter,
                 corner_style: *corner_style,
                 fill_kind: *fill_kind,
+                // Set by the DXF polygon picker; the SVG/rectangle paths
+                // leave it unset and route a single region.
+                geometry: None,
             };
             let result = result.clone();
             let error = error.clone();

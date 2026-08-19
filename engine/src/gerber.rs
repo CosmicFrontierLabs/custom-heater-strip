@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
+use crate::terminals::Pad;
 use crate::{Design, Point};
 
 /// mm → X4.6 integer coordinate.
@@ -92,35 +93,47 @@ impl GerberFile {
         let _ = writeln!(self.body, "X{x}Y{y}D03*");
     }
 
+    /// Flood-fill a closed contour as a Gerber region (G36/G37). Used for
+    /// solder tabs whose shape came from the user's DXF, where no standard
+    /// aperture would do.
+    fn region(&mut self, ring: &[Point]) {
+        if ring.len() < 3 {
+            return;
+        }
+        let _ = writeln!(self.body, "G36*");
+        self.polyline(ring);
+        // Close the contour explicitly; some CAM readers require it.
+        let (x, y) = xy(&ring[0]);
+        let _ = writeln!(self.body, "X{x}Y{y}D01*");
+        let _ = writeln!(self.body, "G37*");
+    }
+
     fn finish(mut self) -> String {
         self.body.push_str("M02*\n");
         self.body
     }
 }
 
+/// Soldermask relief around each pad, mm.
+const MASK_GROW_MM: f64 = 0.05;
+
 pub fn render(design: &Design) -> BTreeMap<String, String> {
     let mut files = BTreeMap::new();
-    let [pad_a, pad_b] = design.pads;
 
-    // Top copper: serpentine strokes + rectangular terminal pads.
+    // Top copper: trace strokes + terminal pads. Rectangular pads flash a
+    // rect aperture; DXF-shaped pads are emitted as filled regions.
     let mut cu = GerberFile::new("Copper,L1,Top", "Positive");
     cu.circle_aperture(10, design.trace_width_mm);
-    cu.rect_aperture(11, pad_a.w, pad_a.h);
+    let rect_dcode = rect_pad_aperture(&mut cu, design, 0.0);
     cu.select(10);
     cu.path(&design.trace);
-    cu.select(11);
-    for p in [&pad_a, &pad_b] {
-        cu.flash(&Point::new(p.cx, p.cy));
-    }
+    emit_pads(&mut cu, design, rect_dcode, 0.0);
     files.insert("heater-F_Cu.gtl".to_string(), cu.finish());
 
     // Top soldermask: openings over the pads so they're solderable.
     let mut mask = GerberFile::new("Soldermask,Top", "Negative");
-    mask.rect_aperture(10, pad_a.w + 0.1, pad_a.h + 0.1);
-    mask.select(10);
-    for p in [&pad_a, &pad_b] {
-        mask.flash(&Point::new(p.cx, p.cy));
-    }
+    let mask_dcode = rect_pad_aperture(&mut mask, design, MASK_GROW_MM);
+    emit_pads(&mut mask, design, mask_dcode, MASK_GROW_MM);
     files.insert("heater-F_Mask.gts".to_string(), mask.finish());
 
     // Top silkscreen: stroked-text legend (specs + stackup).
@@ -146,6 +159,33 @@ pub fn render(design: &Design) -> BTreeMap<String, String> {
     files.insert("heater-Edge_Cuts.gko".to_string(), edge.finish());
 
     files
+}
+
+/// Declare a rect aperture sized for the design's rectangular pads, if it has
+/// any. Returns the D-code to select, or `None` when every pad is a polygon.
+fn rect_pad_aperture(f: &mut GerberFile, design: &Design, grow: f64) -> Option<u32> {
+    let r = design.pads.iter().find_map(|p| match p {
+        Pad::Rect(r) => Some(*r),
+        Pad::Poly(_) => None,
+    })?;
+    let g = r.grown(grow);
+    f.rect_aperture(11, g.w, g.h);
+    Some(11)
+}
+
+/// Flash the rectangular pads and flood-fill the polygon ones.
+fn emit_pads(f: &mut GerberFile, design: &Design, rect_dcode: Option<u32>, grow: f64) {
+    for pad in &design.pads {
+        match pad {
+            Pad::Rect(r) => {
+                if let Some(d) = rect_dcode {
+                    f.select(d);
+                    f.flash(&r.center());
+                }
+            }
+            Pad::Poly(_) => f.region(&pad.grown_ring(grow)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,7 +216,7 @@ mod tests {
         assert!(cu.contains("D01*"), "no draw commands in copper layer");
         assert!(cu.contains("%ADD11R,"), "pads should use a rect aperture");
         assert!(
-            files["heater-F_Mask.gts"].contains("%ADD10R,"),
+            files["heater-F_Mask.gts"].contains("%ADD11R,"),
             "mask openings should be rectangular"
         );
     }

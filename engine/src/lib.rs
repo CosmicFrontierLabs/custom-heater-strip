@@ -12,14 +12,15 @@ mod gerber;
 mod kicad;
 mod outline;
 mod preview;
+mod regions;
 mod silk;
 mod solver;
 mod terminals;
 
-use shared::{DesignReport, DesignRequest, DesignResponse};
+use shared::{DesignReport, DesignRequest, DesignResponse, GeometrySpec};
 
 pub use outline::Polygon;
-pub use terminals::PadRect;
+pub use terminals::{Pad, PadRect};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -35,6 +36,8 @@ pub enum EngineError {
     DxfParse(String),
     #[error("no closed rings found in the DXF")]
     NoDxfPolygons,
+    #[error("geometry selection is incomplete: {0}")]
+    BadGeometry(String),
 }
 
 /// A point in board coordinates, millimeters, y-down (SVG convention).
@@ -135,12 +138,17 @@ impl PathSeg {
 
 /// Everything computed for one design: geometry + electrical numbers.
 pub struct Design {
+    /// Board profile, on Edge.Cuts.
     pub outline: Polygon,
+    /// The heated regions. A plain strip has exactly one (the outline); a
+    /// design from a DXF selection has one per chosen heater polygon, filled
+    /// and chained in series.
+    pub regions: Vec<Polygon>,
     /// The full trace centerline (pad to pad), in mm.
     pub trace: Vec<PathSeg>,
     pub trace_width_mm: f64,
-    /// The two rectangular solder pads, symmetric about the centerline.
-    pub pads: [PadRect; 2],
+    /// The two solder pads, in [input, output] order.
+    pub pads: Vec<Pad>,
     /// Silkscreen legend strokes (voltage/resistance/power/stackup notes).
     pub silk: silk::Silk,
     pub report: DesignReport,
@@ -160,7 +168,20 @@ pub fn generate(req: &DesignRequest) -> Result<DesignResponse, EngineError> {
 }
 
 /// Solve the electrical + geometric design without generating output files.
+///
+/// Two input paths: an SVG outline routed as a single region with
+/// auto-placed pads, or an explicit DXF polygon selection whose heater
+/// regions are chained in series between the user's own solder tabs.
 pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
+    match &req.geometry {
+        Some(spec) => design_from_geometry(req, spec),
+        None => design_from_svg(req),
+    }
+}
+
+/// The single-region path: one SVG outline, pads placed in a pocket at the
+/// left edge, feeds routed through the pocket lanes.
+fn design_from_svg(req: &DesignRequest) -> Result<Design, EngineError> {
     let mut warnings = Vec::new();
 
     let outline = outline::parse_svg_outline(&req.svg, &mut warnings)?;
@@ -220,6 +241,8 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
         trace_length_mm: length_mm,
         outline_area_cm2: area_mm2 / 100.0,
         power_density_w_cm2: refined.achieved_watts / (area_mm2 / 100.0),
+        region_count: 1,
+        link_length_mm: 0.0,
         copper_thickness_um: solved.thickness_m * 1e6,
         warnings,
     };
@@ -235,13 +258,171 @@ pub fn design(req: &DesignRequest) -> Result<Design, EngineError> {
     report.warnings.extend(silk_warnings);
 
     Ok(Design {
+        regions: vec![outline.clone()],
         outline,
         trace,
         trace_width_mm: refined.width_mm,
-        pads: plan.pads,
+        pads: plan.pads.into_iter().map(Pad::Rect).collect(),
         silk,
         report,
     })
+}
+
+/// The DXF path: fill each selected heater polygon and chain them in series
+/// between the two tab polygons, which become the pad copper themselves.
+fn design_from_geometry(req: &DesignRequest, spec: &GeometrySpec) -> Result<Design, EngineError> {
+    let mut warnings = Vec::new();
+
+    let to_polygon = |ring: &Vec<[f64; 2]>| Polygon {
+        points: ring.iter().map(|p| Point::new(p[0], p[1])).collect(),
+    };
+
+    let heaters: Vec<Polygon> = spec.heaters.iter().map(to_polygon).collect();
+    if heaters.is_empty() {
+        return Err(EngineError::BadGeometry(
+            "select at least one polygon as a heater region".into(),
+        ));
+    }
+    for h in &heaters {
+        if h.points.len() < 3 {
+            return Err(EngineError::BadGeometry(
+                "a heater region has fewer than three points".into(),
+            ));
+        }
+    }
+
+    let (Some(tab_in_ring), Some(tab_out_ring)) = (&spec.tab_in, &spec.tab_out) else {
+        return Err(EngineError::BadGeometry(
+            "both an input and an output solder tab must be selected".into(),
+        ));
+    };
+    let tab_in = Pad::Poly(to_polygon(tab_in_ring));
+    let tab_out = Pad::Poly(to_polygon(tab_out_ring));
+
+    // Heated area is the sum over regions; the electrical solve is unchanged
+    // because resistance depends on total routed length, not on how many
+    // pieces the copper is spread across.
+    let area_mm2: f64 = heaters.iter().map(|h| h.area_mm2()).sum();
+    if area_mm2 < 1.0 {
+        return Err(EngineError::OutlineTooSmall(format!(
+            "selected heater area is {area_mm2:.3} mm²; expected at least 1 mm²"
+        )));
+    }
+
+    let solved = solver::solve(req, area_mm2)?;
+    let inset = req.edge_margin_mm + solved.width_mm / 2.0;
+    // Fill must clear pad copper by an edge margin plus half a trace.
+    let pad_clearance = req.edge_margin_mm + solved.width_mm / 2.0 + req.min_gap_mm;
+
+    let chain = regions::plan(&heaters, &tab_in, &tab_out, pad_clearance, &mut warnings)?;
+    let routed = regions::route(
+        &chain,
+        req.fill_kind,
+        solved.pitch_mm,
+        inset,
+        req.corner_style,
+        &tab_in,
+        &tab_out,
+        &mut warnings,
+    )?;
+    let regions::Routed {
+        trace,
+        link_indices,
+        link_length_mm,
+    } = routed;
+
+    // Straight links are correct when a tab sits near the terminals it feeds.
+    // When it does not, say so rather than shipping a short.
+    let crossings = regions::count_link_crossings(&trace, &link_indices);
+    if crossings > 0 {
+        warnings.push(format!(
+            "{crossings} place(s) where a connecting run crosses other copper. \
+             Move the solder tabs nearer the edge of their heater region, or \
+             reorder the regions, before sending this to fab."
+        ));
+    }
+
+    let length_mm: f64 = trace.iter().map(|s| s.length()).sum();
+    let refined = solver::refine(req, &solved, length_mm, &mut warnings);
+
+    let outline = match &spec.outline {
+        Some(ring) => to_polygon(ring),
+        // No explicit profile: wrap everything with an edge margin.
+        None => bounding_outline(
+            heaters
+                .iter()
+                .chain(std::iter::once(&Polygon {
+                    points: tab_in.ring(),
+                }))
+                .chain(std::iter::once(&Polygon {
+                    points: tab_out.ring(),
+                })),
+            req.edge_margin_mm,
+        ),
+    };
+
+    if link_length_mm > 0.25 * length_mm {
+        warnings.push(format!(
+            "{:.0}% of the trace length is interconnect between regions and \
+             tabs, which heats outside the heater areas",
+            100.0 * link_length_mm / length_mm
+        ));
+    }
+
+    let mut report = DesignReport {
+        target_resistance_ohms: refined.target_resistance_ohms,
+        achieved_resistance_ohms: refined.achieved_resistance_ohms,
+        achieved_watts: refined.achieved_watts,
+        operating_current_amps: refined.operating_current_amps,
+        current_headroom_frac: refined.operating_current_amps / req.max_current,
+        trace_width_mm: refined.width_mm,
+        trace_gap_mm: solved.pitch_mm - refined.width_mm,
+        trace_length_mm: length_mm,
+        outline_area_cm2: area_mm2 / 100.0,
+        power_density_w_cm2: refined.achieved_watts / (area_mm2 / 100.0),
+        region_count: chain.regions.len(),
+        link_length_mm,
+        copper_thickness_um: solved.thickness_m * 1e6,
+        warnings,
+    };
+
+    // The legend goes on the board, clear of the copper: reserve the width of
+    // the leftmost heater region so it lands beside the artwork, not over it.
+    let mut silk_warnings = Vec::new();
+    let silk = silk::generate(&outline, 0.0, req, &report, &mut silk_warnings);
+    report.warnings.extend(silk_warnings);
+
+    Ok(Design {
+        outline,
+        regions: chain.regions.into_iter().map(|r| r.polygon).collect(),
+        trace,
+        trace_width_mm: refined.width_mm,
+        pads: vec![tab_in, tab_out],
+        silk,
+        report,
+    })
+}
+
+/// Axis-aligned box around a set of polygons, grown by `margin_mm`.
+fn bounding_outline<'a>(polys: impl Iterator<Item = &'a Polygon>, margin_mm: f64) -> Polygon {
+    let mut min = Point::new(f64::INFINITY, f64::INFINITY);
+    let mut max = Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for poly in polys {
+        let (lo, hi) = poly.bbox();
+        min.x = min.x.min(lo.x);
+        min.y = min.y.min(lo.y);
+        max.x = max.x.max(hi.x);
+        max.y = max.y.max(hi.y);
+    }
+    let m = margin_mm;
+    Polygon {
+        points: vec![
+            Point::new(min.x - m, min.y - m),
+            Point::new(max.x + m, min.y - m),
+            Point::new(max.x + m, max.y + m),
+            Point::new(min.x - m, max.y + m),
+        ],
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +500,202 @@ mod tests {
         }
     }
 
+    fn ring(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<[f64; 2]> {
+        vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    }
+
+    /// Three 30×20 regions in a row with tabs off either end.
+    fn chained_request(regions: usize) -> DesignRequest {
+        let heaters = (0..regions)
+            .map(|i| {
+                let x = 10.0 + i as f64 * 40.0;
+                ring(x, 5.0, x + 30.0, 25.0)
+            })
+            .collect();
+        DesignRequest {
+            geometry: Some(GeometrySpec {
+                outline: None,
+                heaters,
+                tab_in: Some(ring(2.0, 12.0, 8.0, 18.0)),
+                tab_out: Some(ring(
+                    10.0 + regions as f64 * 40.0,
+                    12.0,
+                    16.0 + regions as f64 * 40.0,
+                    18.0,
+                )),
+            }),
+            voltage: 12.0,
+            watts: 10.0,
+            max_current: 2.0,
+            copper_oz: 0.5,
+            min_trace_mm: 0.15,
+            min_gap_mm: 0.15,
+            edge_margin_mm: 0.5,
+            ..DesignRequest::default()
+        }
+    }
+
+    #[test]
+    fn chained_regions_form_one_continuous_trace() {
+        let d = design(&chained_request(3)).unwrap();
+        assert_eq!(d.report.region_count, 3);
+        assert_eq!(d.regions.len(), 3);
+        // Continuity is what makes it a single heater: every segment must
+        // start where the previous one ended.
+        let mut prev: Option<Point> = None;
+        for seg in &d.trace {
+            if let Some(p) = prev {
+                assert!(
+                    p.dist(&seg.start()) < 1e-6,
+                    "gap at ({:.4},{:.4})",
+                    p.x,
+                    p.y
+                );
+            }
+            prev = Some(seg.end());
+        }
+        // The chain must physically start on one pad and end on the other.
+        let start = d.trace.first().unwrap().start();
+        let end = d.trace.last().unwrap().end();
+        assert!(start.dist(&d.pads[0].center()) < 1e-6, "{start:?}");
+        assert!(end.dist(&d.pads[1].center()) < 1e-6, "{end:?}");
+    }
+
+    #[test]
+    fn chained_design_hits_target_resistance() {
+        let d = design(&chained_request(3)).unwrap();
+        let r = &d.report;
+        assert!((r.target_resistance_ohms - 14.4).abs() < 1e-9);
+        let err = (r.achieved_resistance_ohms - r.target_resistance_ohms).abs()
+            / r.target_resistance_ohms;
+        assert!(
+            err < 0.25,
+            "achieved {} vs target {}",
+            r.achieved_resistance_ohms,
+            r.target_resistance_ohms
+        );
+        // Heated area is the sum of the three 30×20 regions = 1800 mm².
+        assert!(
+            (r.outline_area_cm2 - 18.0).abs() < 0.01,
+            "{}",
+            r.outline_area_cm2
+        );
+        // Links exist (tabs sit outside the regions) but stay a small share.
+        assert!(r.link_length_mm > 0.0);
+        assert!(r.link_length_mm < 0.25 * r.trace_length_mm);
+    }
+
+    #[test]
+    fn tabs_become_polygon_pads_in_every_output() {
+        let resp = generate(&chained_request(2)).unwrap();
+        // Polygon pads are Gerber regions, not aperture flashes.
+        let cu = &resp.gerbers["heater-F_Cu.gtl"];
+        assert!(cu.contains("G36*"), "no region fill for the polygon pads");
+        assert!(cu.contains("G37*"));
+        assert!(
+            resp.gerbers["heater-F_Mask.gts"].contains("G36*"),
+            "mask openings should be regions too"
+        );
+        // KiCad gets filled polygons on both copper and mask.
+        assert_eq!(
+            resp.kicad_pcb.matches("(gr_poly (pts").count(),
+            4,
+            "expected 2 pads × (F.Cu + F.Mask)"
+        );
+        let open = resp.kicad_pcb.matches('(').count();
+        assert_eq!(
+            open,
+            resp.kicad_pcb.matches(')').count(),
+            "unbalanced sexpr"
+        );
+    }
+
+    #[test]
+    fn a_single_region_with_tabs_still_works() {
+        // One 60×40 region: a lone 30×20 patch cannot dissipate 10 W at 12 V
+        // without going under the fab's trace minimum, which the solver
+        // rightly rejects.
+        let req = DesignRequest {
+            geometry: Some(GeometrySpec {
+                outline: None,
+                heaters: vec![ring(10.0, 5.0, 70.0, 45.0)],
+                tab_in: Some(ring(2.0, 22.0, 8.0, 28.0)),
+                tab_out: Some(ring(72.0, 22.0, 78.0, 28.0)),
+            }),
+            ..chained_request(1)
+        };
+        let d = design(&req).unwrap();
+        assert_eq!(d.report.region_count, 1);
+        assert!(d.report.trace_length_mm > 100.0);
+        // Both tabs are polygons the user supplied, not auto-placed rects.
+        assert!(matches!(d.pads[0], Pad::Poly(_)));
+        assert!(matches!(d.pads[1], Pad::Poly(_)));
+    }
+
+    #[test]
+    fn every_fill_kind_chains_across_regions() {
+        for kind in shared::FillKind::ALL {
+            let req = DesignRequest {
+                fill_kind: kind,
+                ..chained_request(2)
+            };
+            let d = design(&req).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let mut prev: Option<Point> = None;
+            for seg in &d.trace {
+                if let Some(p) = prev {
+                    assert!(p.dist(&seg.start()) < 1e-6, "{kind:?} path gap");
+                }
+                prev = Some(seg.end());
+            }
+            assert_eq!(d.report.region_count, 2, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn geometry_without_both_tabs_is_rejected() {
+        let mut req = chained_request(1);
+        req.geometry.as_mut().unwrap().tab_out = None;
+        assert!(matches!(design(&req), Err(EngineError::BadGeometry(_))));
+
+        let mut req = chained_request(1);
+        req.geometry.as_mut().unwrap().heaters.clear();
+        assert!(matches!(design(&req), Err(EngineError::BadGeometry(_))));
+    }
+
+    #[test]
+    fn an_interior_tab_is_notched_out_and_warned_about_if_it_splits() {
+        // Tab planted in the middle of a single big region.
+        let req = DesignRequest {
+            geometry: Some(GeometrySpec {
+                outline: None,
+                heaters: vec![ring(0.0, 0.0, 60.0, 40.0)],
+                tab_in: Some(ring(28.0, 18.0, 32.0, 22.0)),
+                tab_out: Some(ring(65.0, 18.0, 70.0, 22.0)),
+            }),
+            ..chained_request(1)
+        };
+        let d = design(&req).unwrap();
+        // The fill must not cover the pad it feeds.
+        let pad_centre = d.pads[0].center();
+        assert!(
+            !d.regions[0].contains(pad_centre),
+            "interior tab was left under copper"
+        );
+        assert!(d.report.trace_length_mm > 100.0);
+    }
+
+    #[test]
+    fn explicit_outline_is_used_for_the_board_profile() {
+        let mut req = chained_request(2);
+        req.geometry.as_mut().unwrap().outline = Some(ring(-5.0, -5.0, 200.0, 60.0));
+        let d = design(&req).unwrap();
+        let (lo, hi) = d.outline.bbox();
+        assert!(
+            (lo.x + 5.0).abs() < 1e-9 && (hi.x - 200.0).abs() < 1e-9,
+            "{lo:?} {hi:?}"
+        );
+    }
+
     /// Every index pair in a design's trace that shorts, arcs handled exactly.
     fn trace_shorts(d: &Design) -> Vec<(usize, usize)> {
         let all: Vec<usize> = (0..d.trace.len()).collect();
@@ -348,10 +725,10 @@ mod tests {
         }
     }
 
-    /// Pins the known counterflow defect (issue #5) to a specific pair of
-    /// segments rather than a screenshot. When the feed routing is fixed this
-    /// test fails: delete it and drop the skip in
-    /// `routed_traces_do_not_short_against_themselves`.
+    /// Documents the known counterflow defect so the diagnosis stays pinned to
+    /// a specific pair of segments rather than a screenshot. Flip this to the
+    /// clean assertion in `routed_traces_do_not_short_against_themselves`
+    /// once the feed routing is fixed.
     #[test]
     fn counterflow_currently_shorts_its_feed_against_the_return_arm() {
         let req = DesignRequest {
@@ -367,7 +744,7 @@ mod tests {
         );
         // The short is at the pads: one of the offending segments is a feed
         // run touching a pad centre.
-        let pad_centres: Vec<Point> = d.pads.iter().map(|p| Point::new(p.cx, p.cy)).collect();
+        let pad_centres: Vec<Point> = d.pads.iter().map(|p| p.center()).collect();
         let touches_pad = shorts.iter().any(|(i, j)| {
             [*i, *j].iter().any(|k| {
                 let s = &d.trace[*k];

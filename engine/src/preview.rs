@@ -28,6 +28,18 @@ pub fn render(design: &Design) -> String {
         polyline_d(&design.outline.points, true)
     );
 
+    // Heater regions, when they are not simply the whole board — outlining
+    // them makes a series-chained multi-region design readable.
+    if design.regions.len() > 1 {
+        for region in &design.regions {
+            let _ = write!(
+                svg,
+                r##"<path d="{}" fill="#7aa2f7" fill-opacity="0.10" stroke="#7aa2f7" stroke-width="0.1" stroke-dasharray="0.8 0.6"/>"##,
+                polyline_d(&region.points, true)
+            );
+        }
+    }
+
     // Copper serpentine.
     let _ = write!(
         svg,
@@ -46,16 +58,27 @@ pub fn render(design: &Design) -> String {
         );
     }
 
-    // Rectangular terminal pads.
-    for p in &design.pads {
-        let _ = write!(
-            svg,
-            r##"<rect x="{:.4}" y="{:.4}" width="{:.4}" height="{:.4}" fill="#e8c56b" stroke="#8c6d1f" stroke-width="0.15"/>"##,
-            p.cx - p.w / 2.0,
-            p.cy - p.h / 2.0,
-            p.w,
-            p.h
-        );
+    // Terminal pads: rectangles stay rects, DXF-shaped tabs draw their ring.
+    for pad in &design.pads {
+        match pad {
+            crate::terminals::Pad::Rect(p) => {
+                let _ = write!(
+                    svg,
+                    r##"<rect x="{:.4}" y="{:.4}" width="{:.4}" height="{:.4}" fill="#e8c56b" stroke="#8c6d1f" stroke-width="0.15"/>"##,
+                    p.cx - p.w / 2.0,
+                    p.cy - p.h / 2.0,
+                    p.w,
+                    p.h
+                );
+            }
+            crate::terminals::Pad::Poly(poly) => {
+                let _ = write!(
+                    svg,
+                    r##"<path d="{}" fill="#e8c56b" stroke="#8c6d1f" stroke-width="0.15"/>"##,
+                    polyline_d(&poly.points, true)
+                );
+            }
+        }
     }
 
     svg.push_str("</svg>");
@@ -112,15 +135,17 @@ mod tests {
 
     #[test]
     fn preview_contains_outline_and_trace() {
+        let outline = Polygon {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(10.0, 5.0),
+                Point::new(0.0, 5.0),
+            ],
+        };
         let design = Design {
-            outline: Polygon {
-                points: vec![
-                    Point::new(0.0, 0.0),
-                    Point::new(10.0, 0.0),
-                    Point::new(10.0, 5.0),
-                    Point::new(0.0, 5.0),
-                ],
-            },
+            regions: vec![outline.clone()],
+            outline,
             trace: vec![
                 crate::PathSeg::Line {
                     a: Point::new(1.0, 1.0),
@@ -138,19 +163,19 @@ mod tests {
                 },
             ],
             trace_width_mm: 0.4,
-            pads: [
-                crate::PadRect {
+            pads: vec![
+                crate::Pad::Rect(crate::PadRect {
                     cx: 1.0,
                     cy: 1.0,
                     w: 2.0,
                     h: 1.25,
-                },
-                crate::PadRect {
+                }),
+                crate::Pad::Rect(crate::PadRect {
                     cx: 1.0,
                     cy: 4.0,
                     w: 2.0,
                     h: 1.25,
-                },
+                }),
             ],
             silk: crate::silk::Silk {
                 strokes: vec![],
@@ -167,6 +192,8 @@ mod tests {
                 trace_length_mm: 19.0,
                 outline_area_cm2: 0.5,
                 power_density_w_cm2: 2.0,
+                region_count: 1,
+                link_length_mm: 0.0,
                 copper_thickness_um: 17.4,
                 warnings: vec![],
             },

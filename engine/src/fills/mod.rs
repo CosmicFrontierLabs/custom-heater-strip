@@ -13,6 +13,8 @@ use shared::{CornerStyle, FillKind};
 
 use crate::{outline::Polygon, EngineError, PathSeg};
 
+pub use offset::reverse_path;
+
 /// The area reserved for the terminals. The fill stays dense: only rows
 /// crossing the pocket's y-band give way to the pads; everywhere else the
 /// pattern may run as far left as `lane_edge` (a thin corridor for the
@@ -29,9 +31,10 @@ pub struct Reserve {
 }
 
 impl Reserve {
-    /// No reservation at all (used by pattern unit tests).
-    #[cfg(test)]
-    pub(crate) fn none() -> Self {
+    /// No reservation at all: the pattern may use the whole polygon. Used by
+    /// multi-region routing, where tab keepouts are cut out of the region
+    /// beforehand rather than reserved during the fill.
+    pub fn none() -> Self {
         Reserve {
             lane_edge: f64::NEG_INFINITY,
             pocket_x1: f64::NEG_INFINITY,

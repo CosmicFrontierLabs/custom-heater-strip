@@ -24,6 +24,40 @@ impl Polygon {
         signed_area(&self.points).abs()
     }
 
+    /// Area centroid (shoelace). Falls back to the vertex mean for degenerate
+    /// rings, so it is always inside a convex tab.
+    pub fn centroid(&self) -> Point {
+        let pts = &self.points;
+        let n = pts.len();
+        let a = signed_area(pts);
+        if a.abs() < 1e-12 {
+            let (sx, sy) = pts
+                .iter()
+                .fold((0.0, 0.0), |(sx, sy), p| (sx + p.x, sy + p.y));
+            return Point::new(sx / n as f64, sy / n as f64);
+        }
+        let (mut cx, mut cy) = (0.0, 0.0);
+        for i in 0..n {
+            let (p, q) = (pts[i], pts[(i + 1) % n]);
+            let cross = p.x * q.y - q.x * p.y;
+            cx += (p.x + q.x) * cross;
+            cy += (p.y + q.y) * cross;
+        }
+        Point::new(cx / (6.0 * a), cy / (6.0 * a))
+    }
+
+    /// Even-odd containment test (ray cast to +x).
+    pub fn contains(&self, p: Point) -> bool {
+        let hits = self.scanline_hits(p.y);
+        hits.iter().filter(|x| **x > p.x).count() % 2 == 1
+    }
+
+    /// Does any part of `other`'s ring fall inside this polygon?
+    pub fn overlaps(&self, other: &Polygon) -> bool {
+        other.points.iter().any(|p| self.contains(*p))
+            || self.points.iter().any(|p| other.contains(*p))
+    }
+
     pub fn bbox(&self) -> (Point, Point) {
         let mut min = Point::new(f64::INFINITY, f64::INFINITY);
         let mut max = Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -52,6 +86,59 @@ impl Polygon {
         }
         xs.sort_by(|p, q| p.partial_cmp(q).unwrap());
         xs
+    }
+}
+
+/// Result of cutting one polygon out of another.
+pub struct Subtraction {
+    /// The largest remaining piece.
+    pub largest: Polygon,
+    /// How many disjoint pieces the cut produced (>1 means the subtraction
+    /// split the region and coverage was dropped).
+    pub pieces: usize,
+}
+
+impl Polygon {
+    /// Subtract `hole` from this polygon. Returns `None` when nothing is left.
+    ///
+    /// Only the largest surviving piece is kept: the fill patterns route a
+    /// single continuous path through one region, so a cut that fragments the
+    /// region necessarily loses the smaller fragments. `pieces` lets the
+    /// caller warn about that.
+    pub fn subtract(&self, hole: &Polygon) -> Option<Subtraction> {
+        use cavalier_contours::polyline::{BooleanOp, PlineSource, PlineSourceMut, Polyline};
+
+        let to_pline = |poly: &Polygon| {
+            let mut pl = Polyline::new_closed();
+            for p in &poly.points {
+                pl.add(p.x, p.y, 0.0);
+            }
+            if pl.area() < 0.0 {
+                pl.invert_direction_mut();
+            }
+            pl
+        };
+
+        let result = to_pline(self).boolean(&to_pline(hole), BooleanOp::Not);
+        let pieces = result.pos_plines.len();
+        let largest = result
+            .pos_plines
+            .into_iter()
+            .map(|r| r.pline)
+            .max_by(|a, b| a.area().abs().partial_cmp(&b.area().abs()).unwrap())?;
+        let points: Vec<Point> = (0..largest.vertex_count())
+            .map(|i| {
+                let v = largest.at(i);
+                Point::new(v.x, v.y)
+            })
+            .collect();
+        if points.len() < 3 {
+            return None;
+        }
+        Some(Subtraction {
+            largest: Polygon { points },
+            pieces,
+        })
     }
 }
 

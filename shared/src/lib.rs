@@ -96,6 +96,11 @@ pub struct DesignRequest {
     /// Which fill pattern routes the heater trace.
     #[serde(default)]
     pub fill_kind: FillKind,
+    /// Explicit polygon geometry from a DXF upload. When set, this supersedes
+    /// `svg`: the listed heater regions are filled and chained in series and
+    /// the tab polygons become the solder pads.
+    #[serde(default)]
+    pub geometry: Option<GeometrySpec>,
 }
 
 /// Trace fill pattern. All patterns produce one continuous non-crossing
@@ -179,6 +184,10 @@ fn default_pad_diameter() -> f64 {
     2.5
 }
 
+fn one() -> usize {
+    1
+}
+
 impl Default for DesignRequest {
     fn default() -> Self {
         Self {
@@ -193,6 +202,7 @@ impl Default for DesignRequest {
             pad_diameter_mm: default_pad_diameter(),
             corner_style: CornerStyle::default(),
             fill_kind: FillKind::default(),
+            geometry: None,
         }
     }
 }
@@ -277,7 +287,7 @@ pub enum PolygonRole {
     Unused,
     /// The board profile on Edge.Cuts. Defaults to the heaters' bounds.
     Outline,
-    /// A region to fill with heater trace.
+    /// A region to fill with heater trace. Several regions chain in series.
     Heater,
     /// The supply-side solder tab; its polygon becomes the pad copper.
     TabIn,
@@ -323,6 +333,23 @@ impl PolygonRole {
     }
 }
 
+/// Explicit polygon geometry, used instead of SVG outline extraction when the
+/// design came from a DXF with roles assigned in the picker.
+///
+/// Rings are closed, in mm, y-down. Heater regions are filled in the order
+/// given and chained in series; the tabs become the actual pad copper.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GeometrySpec {
+    /// Board profile. When `None`, the bounding box of everything else is used.
+    #[serde(default)]
+    pub outline: Option<Vec<[f64; 2]>>,
+    pub heaters: Vec<Vec<[f64; 2]>>,
+    #[serde(default)]
+    pub tab_in: Option<Vec<[f64; 2]>>,
+    #[serde(default)]
+    pub tab_out: Option<Vec<[f64; 2]>>,
+}
+
 /// Computed electrical + geometric summary of a generated heater design.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesignReport {
@@ -346,6 +373,13 @@ pub struct DesignReport {
     pub outline_area_cm2: f64,
     /// Average power density over the outline, in W/cm².
     pub power_density_w_cm2: f64,
+    /// How many heater regions were chained in series (1 for a plain strip).
+    #[serde(default = "one")]
+    pub region_count: usize,
+    /// Length of the traces linking the regions to each other and to the
+    /// tabs, in mm — resistance that heats the interconnect, not the board.
+    #[serde(default)]
+    pub link_length_mm: f64,
     /// Copper thickness used, in µm.
     pub copper_thickness_um: f64,
     /// Non-fatal issues the generator noticed (concave regions, clamped widths…).

@@ -22,6 +22,7 @@
 //! without ever crossing pad copper.
 
 use crate::fills::Reserve;
+use crate::outline::Polygon;
 use crate::{EngineError, PathSeg, Point};
 
 /// A rectangular solder pad, center + size, board mm.
@@ -31,6 +32,94 @@ pub struct PadRect {
     pub cy: f64,
     pub w: f64,
     pub h: f64,
+}
+
+impl PadRect {
+    pub fn center(&self) -> Point {
+        Point::new(self.cx, self.cy)
+    }
+
+    /// Corner ring, clockwise from the top-left in the y-down frame.
+    pub fn ring(&self) -> Vec<Point> {
+        let (x0, y0) = (self.cx - self.w / 2.0, self.cy - self.h / 2.0);
+        let (x1, y1) = (self.cx + self.w / 2.0, self.cy + self.h / 2.0);
+        vec![
+            Point::new(x0, y0),
+            Point::new(x1, y0),
+            Point::new(x1, y1),
+            Point::new(x0, y1),
+        ]
+    }
+
+    /// The same rectangle grown by `d` on every side (mask openings).
+    pub fn grown(&self, d: f64) -> PadRect {
+        PadRect {
+            cx: self.cx,
+            cy: self.cy,
+            w: self.w + 2.0 * d,
+            h: self.h + 2.0 * d,
+        }
+    }
+}
+
+/// A solder terminal's copper. Auto-placed designs get a rectangle; designs
+/// driven by a DXF selection get the user's own polygon, so the pad is
+/// whatever shape they drew.
+#[derive(Debug, Clone)]
+pub enum Pad {
+    Rect(PadRect),
+    Poly(Polygon),
+}
+
+impl Pad {
+    /// Where a feed trace should meet the pad.
+    pub fn center(&self) -> Point {
+        match self {
+            Pad::Rect(r) => r.center(),
+            Pad::Poly(p) => p.centroid(),
+        }
+    }
+
+    pub fn ring(&self) -> Vec<Point> {
+        match self {
+            Pad::Rect(r) => r.ring(),
+            Pad::Poly(p) => p.points.clone(),
+        }
+    }
+
+    pub fn bbox(&self) -> (Point, Point) {
+        match self {
+            Pad::Rect(r) => (
+                Point::new(r.cx - r.w / 2.0, r.cy - r.h / 2.0),
+                Point::new(r.cx + r.w / 2.0, r.cy + r.h / 2.0),
+            ),
+            Pad::Poly(p) => p.bbox(),
+        }
+    }
+
+    /// The pad outline grown by `d` on every side, for soldermask openings.
+    /// Polygon pads are offset by scaling about the centroid, which is exact
+    /// for convex tabs and slightly conservative for concave ones.
+    pub fn grown_ring(&self, d: f64) -> Vec<Point> {
+        match self {
+            Pad::Rect(r) => r.grown(d).ring(),
+            Pad::Poly(p) => {
+                let c = p.centroid();
+                p.points
+                    .iter()
+                    .map(|v| {
+                        let (dx, dy) = (v.x - c.x, v.y - c.y);
+                        let len = (dx * dx + dy * dy).sqrt();
+                        if len < 1e-9 {
+                            *v
+                        } else {
+                            Point::new(v.x + d * dx / len, v.y + d * dy / len)
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
 }
 
 /// Which lane a pattern's feeds route through.

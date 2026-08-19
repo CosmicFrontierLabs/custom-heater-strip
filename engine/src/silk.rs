@@ -210,6 +210,8 @@ mod tests {
             trace_length_mm: 4000.0,
             outline_area_cm2: 20.0,
             power_density_w_cm2: 0.5,
+            region_count: 1,
+            link_length_mm: 0.0,
             copper_thickness_um: 17.4,
             warnings: vec![],
         }
