@@ -30,33 +30,49 @@ that belongs wherever it is cheapest to run, and the fourth is what Pages is.
 
 ## Size budget
 
-Measured with `trunk build --release`, before `wasm-opt`:
+All figures are `trunk build --release`, which **already runs `wasm-opt -Oz`**
+— `data-wasm-opt="z"` is set in `index.html` and Trunk fetches the tool
+itself. There is no further optimisation pass waiting to be turned on.
 
 | Configuration | raw `.wasm` | gzipped |
 | --- | --- | --- |
-| Frontend alone (engine not linked) | 541 KB | — |
-| **+ engine, `usvg` default features** | **2.04 MB** | **820 KB** |
-| **+ engine, `usvg` without `text`** | **1.25 MB** | **509 KB** |
+| Frontend alone, engine dead-stripped | 541 KB | — |
+| Design path only, `usvg` default features | 2.04 MB | 820 KB |
+| Design path only, `usvg` without `text` | 1.25 MB | 509 KB |
+| **Both paths live, `usvg` without `text`** | **2.15 MB** | **858 KB** |
+| Both paths live, and `image` patched out of `dxf` | 2.10 MB | 835 KB |
 
-`usvg`'s default features pull in `fontdb`, `rustybuzz` and `unicode-bidi` for
-text shaping. This project only reads path geometry out of an SVG, so
-`default-features = false` drops **39 % of the raw bundle** and all 83 engine
-tests still pass. That is a free win and should land regardless of the rest of
-this plan.
+Read that table carefully, because two of the rows are traps.
 
-509 KB gzipped is an acceptable first load for a CAD tool. Two further levers
-if it needs to come down:
+**`usvg` without `text` is a real win.** Its default features pull in
+`fontdb`, `rustybuzz` and `unicode-bidi` to shape text; this project only
+reads path geometry, so `default-features = false` costs nothing and saves
+**790 KB raw / 311 KB gzipped**. Landed in step 1.
 
-- **`wasm-opt -Oz`** — not yet applied to any number above. Trunk can fetch
-  and run it; typically another 15–25 % off the raw size.
-- **`image`, via an upstream feature gate.** `dxf` depends on `image`
-  unconditionally, but only uses it in `thumbnail.rs`, for reading and writing
-  the DXF preview thumbnail — a feature this project never touches. It is
-  isolated to one module, so a `thumbnail` feature in `ixmilia/dxf-rs` is a
-  small, well-formed upstream PR. Until then it is dead weight in the bundle.
+**The 509 KB row is not achievable.** It was measured when nothing yet called
+`engine::dxf`, so the linker dropped the entire DXF reader. Once the DXF
+upload path is live — which is the whole point — the honest number is
+**858 KB gzipped**. Anything quoting 509 KB is quoting a build with the
+feature compiled out.
 
-**Gate the transition on a measured post-`wasm-opt` number.** It is the only
-cost that could make this a bad trade, and it is cheap to check first.
+**Patching `image` out of `dxf` is not worth doing.** `dxf` depends on `image`
+unconditionally and only uses it in `thumbnail.rs`, so an upstream feature
+gate looked like an easy win. Measured by vendoring `dxf` with the dependency
+and thumbnail module surgically removed: it saves **24 KB gzipped**. The
+linker was already stripping almost all of `image`, because nothing reaches
+the thumbnail path. Not worth an upstream PR.
+
+So the ~850 KB raw that the DXF path costs is almost entirely the `dxf`
+crate's own code-generated entity reader — hundreds of entity structs with
+their read and write implementations. That is inherent to using the crate, and
+the only way around it would be writing a minimal DXF reader for the handful
+of entities this project actually wants. Not recommended: the bulge, unit and
+spline handling is exactly the fiddly part worth having someone else maintain.
+
+**858 KB gzipped is the number to accept or reject.** For a niche engineering
+tool loaded occasionally it is defensible — comparable to a mid-sized JS
+SPA — and it buys a tool with no server, no database and no upload of the
+user's geometry.
 
 ## The responsiveness problem
 
@@ -115,20 +131,20 @@ request/response shape allows.
 
 Ordered so each step is independently reviewable and leaves the app working.
 
-1. **Trim `usvg`.** `default-features = false`. Verify the 83 engine tests and
-   re-measure. Lands on its own; benefits the current architecture too.
-2. **Move zip packaging into the engine.** Lift `zip_gerbers` out of
-   `backend/src/handlers/design.rs` so `engine::generate` returns a complete
-   `DesignResponse` with `gerber_zip_base64` populated. Removes the comment
-   in `generate` that says the server fills this in. Backend keeps working.
-3. **Add a wasm entry point.** `engine` as a frontend dependency, plus a thin
-   `wasm-bindgen` surface for "design this request" and "parse this DXF".
-4. **Build the worker.** `gloo-worker`, with the two calls from (3) behind it.
-   Wire the UI to it and delete the two `fetch` calls. At the end of this step
-   the app no longer talks to the server.
-5. **Measure with `wasm-opt`.** Enable it in `Trunk.toml`, record the number.
-   Decision point: if it is unacceptable, stop here — the app still works,
-   and step 4 already removed the runtime dependency on the backend.
+1. ~~**Trim `usvg`.**~~ Done. `default-features = false`; 790 KB raw saved.
+2. ~~**Move zip packaging into the engine.**~~ Done. `engine::generate` now
+   returns a complete `DesignResponse`, so no caller has to finish assembling
+   one.
+3. ~~**Call the engine directly from the frontend.**~~ Done. Both `fetch`
+   calls deleted; verified against a plain static file server with the
+   backend stopped. The app no longer talks to a server at all.
+4. **Move the engine into a Web Worker.** The responsiveness fix. Deliberately
+   *after* step 3 rather than merged into it: step 3 makes the app correct
+   without a server, step 4 makes it pleasant. Splitting them keeps a
+   two-binary Trunk build and worker message plumbing out of the change that
+   had to be verified for numerical parity.
+5. ~~**Measure.**~~ Done: **858 KB gzipped**, post-`wasm-opt -Oz`, with both
+   code paths live. Accepted as the first-load cost. Gate passed.
 6. **Switch to `HashRouter`** and set `--public-url`.
 7. **Delete the backend.** The whole `backend/` crate, the `Dockerfile`, the
    container workflow, the `db` service and volume in `docker-compose.yml`,
@@ -137,12 +153,11 @@ Ordered so each step is independently reviewable and leaves the app working.
    close it as resolved rather than fixing it separately.
 8. **Add the Pages workflow.** `actions/deploy-pages`, building with
    `trunk build --release --public-url /custom-heater-strip/`.
-9. **Rewrite the README.** Quick start becomes `trunk serve`. Add the live
-   URL.
+9. **Rewrite the README.** Quick start becomes `trunk serve`. Add the live URL.
 
-Steps 1–2 are safe to land immediately. Step 4 is the commitment point. Step 7
-is irreversible in spirit, so it should follow a working deployed Pages build,
-not precede it.
+Step 3 was the commitment point and it has passed. Step 4 is independent of
+6–9 and can land in either order. Step 7 deletes working code, so it should
+follow a Pages build that is actually serving, not precede it.
 
 ## What this gives up
 

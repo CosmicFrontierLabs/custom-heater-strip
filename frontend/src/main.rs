@@ -35,10 +35,14 @@ fn switch(route: Route) -> Html {
 
 #[function_component(App)]
 pub fn app() -> Html {
+    // HashRouter, not BrowserRouter: this ships as static files on GitHub
+    // Pages, served from /<repo>/ rather than the domain root. A path router
+    // would need a basename and would 404 on any deep link, because Pages has
+    // no server to rewrite unknown paths back to index.html.
     html! {
-        <BrowserRouter>
+        <HashRouter>
             <Switch<Route> render={switch} />
-        </BrowserRouter>
+        </HashRouter>
     }
 }
 
