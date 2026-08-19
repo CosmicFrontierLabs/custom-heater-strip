@@ -5,6 +5,7 @@
 //! requested power, along with fab outputs: KiCad board, Gerbers, SVG preview,
 //! and a numeric design report.
 
+pub mod dxf;
 mod fills;
 pub mod geom;
 mod gerber;
@@ -30,6 +31,10 @@ pub enum EngineError {
     OutlineTooSmall(String),
     #[error("design infeasible: {0}")]
     Infeasible(String),
+    #[error("DXF parse failed: {0}")]
+    DxfParse(String),
+    #[error("no closed rings found in the DXF")]
+    NoDxfPolygons,
 }
 
 /// A point in board coordinates, millimeters, y-down (SVG convention).

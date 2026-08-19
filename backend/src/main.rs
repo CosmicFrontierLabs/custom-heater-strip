@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/health", get(handlers::health::health))
         .route("/api/design", axum::routing::post(handlers::design::design))
+        .route("/api/dxf", axum::routing::post(handlers::dxf::dxf))
         .with_state(app_state)
         .route(shared::AppSocket::PATH, handlers::websocket::handler())
         .fallback(axum::routing::get(embedded_assets::serve_embedded_frontend))

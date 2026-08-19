@@ -11,3 +11,4 @@ usvg = "0.45"
 
 shared = { path = "../shared" }
 cavalier_contours = "0.7.0"
+dxf = "0.6"
