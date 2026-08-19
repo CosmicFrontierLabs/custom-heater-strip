@@ -211,6 +211,7 @@ fn design_from_svg(req: &DesignRequest) -> Result<Design, EngineError> {
         inset,
         plan.reserve,
         req.corner_style,
+        fills::Terminals::SameSide,
         &mut warnings,
     )?;
 
@@ -648,6 +649,40 @@ mod tests {
                 prev = Some(seg.end());
             }
             assert_eq!(d.report.region_count, 2, "{kind:?}");
+        }
+    }
+
+    /// The payoff of splitting a region's terminals to opposite edges: the
+    /// canonical layout — regions in a row, a tab off each end — routes with
+    /// no copper touching copper anywhere.
+    #[test]
+    fn a_chain_of_regions_in_a_row_routes_without_shorting() {
+        for regions in [1usize, 2, 3, 4] {
+            let req = DesignRequest {
+                voltage: 24.0,
+                watts: 30.0,
+                max_current: 3.0,
+                ..chained_request(regions)
+            };
+            let d = match design(&req) {
+                Ok(d) => d,
+                // Small region counts can be electrically infeasible at these
+                // specs; that is the solver's business, not the router's.
+                Err(EngineError::Infeasible(_)) => continue,
+                Err(e) => panic!("{regions} regions: {e}"),
+            };
+            let shorts = trace_shorts(&d);
+            assert!(
+                shorts.is_empty(),
+                "{regions} regions: {} short(s), first at {:?}",
+                shorts.len(),
+                shorts.first()
+            );
+            assert!(
+                d.report.warnings.iter().all(|w| !w.contains("crosses")),
+                "{regions} regions warned about crossings: {:?}",
+                d.report.warnings
+            );
         }
     }
 

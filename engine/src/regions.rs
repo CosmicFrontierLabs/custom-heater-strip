@@ -15,13 +15,24 @@
 //!
 //! Two problems have to be solved for the joins to be manufacturable.
 //!
-//! **Where a region's terminals land.** Every fill pattern puts both path
-//! ends on the *left* of the polygon it is given. A link that has to reach
-//! around to the far side of a region would cross the fill it just laid
-//! down. So each region is rotated by a multiple of 90° before filling, so
-//! that its left side faces whatever it must connect to, and the routed path
-//! is rotated back afterwards. Only rotations are used — never reflections —
-//! because a reflection would invert every arc's sweep direction.
+//! **Where a region's terminals land.** A link that has to reach around a
+//! region to find its terminal would cross the fill that region just laid
+//! down, shorting it. Two things prevent that:
+//!
+//! - A region whose neighbours lie on *opposite* sides is filled with its two
+//!   ends at opposite edges ([`Terminals::OppositeSides`]), so the run coming
+//!   in and the run going out each meet an edge that faces where they came
+//!   from. A region whose neighbours are both off the *same* side keeps its
+//!   ends together and aims between them.
+//! - The region is then rotated by a multiple of 90° before filling so the
+//!   entry edge faces the incoming run, and the routed path is rotated back.
+//!   Only rotations are used — never reflections — because a reflection would
+//!   invert every arc's sweep direction.
+//!
+//! Only the plain serpentine can split its terminals; the other patterns
+//! always deliver both ends together, so a chain of them may still need a
+//! link that crosses copper. That is detected and warned about rather than
+//! silently shipped.
 //!
 //! **Keeping copper off the pads.** A tab that overlaps a heater region is
 //! cut out of that region (plus clearance) before filling, so the pattern
@@ -29,7 +40,7 @@
 
 use shared::{CornerStyle, FillKind};
 
-use crate::fills::{self, Reserve};
+use crate::fills::{self, Reserve, Terminals};
 use crate::outline::Polygon;
 use crate::terminals::Pad;
 use crate::{EngineError, PathSeg, Point};
@@ -95,8 +106,10 @@ impl Quarter {
 pub struct Region {
     /// The polygon to fill, with tab keepouts already cut out.
     pub polygon: Polygon,
-    /// Where this region's two terminals should face.
+    /// Where this region's entry terminal should face.
     target: Point,
+    /// Whether the two terminals should sit together or at opposite ends.
+    terminals: Terminals,
 }
 
 /// Everything the chainer needs to route a design.
@@ -158,10 +171,33 @@ pub fn plan(
         } else {
             heaters[order[pos + 1]].centroid()
         };
-        let target = Point::new((before.x + after.x) / 2.0, (before.y + after.y) / 2.0);
+
+        // If what this region connects to sits on roughly opposite sides of
+        // it, the fill must enter one side and leave the other; otherwise a
+        // link would have to cross the fill to get out. When both neighbours
+        // are off the same side, keep the ends together and aim between them.
+        let c = heaters[idx].centroid();
+        let (v_in, v_out) = (
+            Point::new(before.x - c.x, before.y - c.y),
+            Point::new(after.x - c.x, after.y - c.y),
+        );
+        let opposed = v_in.x * v_out.x + v_in.y * v_out.y < 0.0;
+        let (terminals, target) = if opposed {
+            // Orient toward the incoming side; the exit lands opposite it.
+            (Terminals::OppositeSides, before)
+        } else {
+            (
+                Terminals::SameSide,
+                Point::new((before.x + after.x) / 2.0, (before.y + after.y) / 2.0),
+            )
+        };
 
         let polygon = cut_tabs(&heaters[idx], [tab_in, tab_out], clearance_mm, warnings)?;
-        regions.push(Region { polygon, target });
+        regions.push(Region {
+            polygon,
+            target,
+            terminals,
+        });
     }
 
     Ok(Chain { regions })
@@ -289,6 +325,7 @@ pub fn route(
             inset_mm,
             Reserve::none(),
             style,
+            region.terminals,
             warnings,
         )?;
         let path = quarter.inverse().rotate_path(&path);

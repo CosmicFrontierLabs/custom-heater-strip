@@ -74,6 +74,23 @@ impl Reserve {
     }
 }
 
+/// Where a pattern should leave its two path ends relative to each other.
+///
+/// A lone heater wants both ends together, next to the pad pocket. A region
+/// in the middle of a series chain wants them at opposite ends, so the run
+/// coming in and the run going out do not have to cross the fill to reach
+/// their neighbours.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Terminals {
+    /// Both ends on the same side.
+    #[default]
+    SameSide,
+    /// Ends on opposite sides. Only the plain serpentine can honour this;
+    /// other patterns ignore it, and the caller warns if that costs a
+    /// crossing.
+    OppositeSides,
+}
+
 /// Route the heater trace with the requested pattern.
 ///
 /// `pitch_mm` is the centerline-to-centerline spacing and `inset_mm` the
@@ -85,16 +102,22 @@ pub fn fill(
     inset_mm: f64,
     reserve: Reserve,
     style: CornerStyle,
+    terminals: Terminals,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathSeg>, EngineError> {
     match kind {
+        // Row count parity decides which side the last row ends on: an even
+        // number of rows returns to the starting side, an odd number crosses.
         FillKind::Serpentine => serpentine::fill(
             outline,
             pitch_mm,
             inset_mm,
             reserve,
             style,
-            serpentine::RowParity::Even,
+            match terminals {
+                Terminals::SameSide => serpentine::RowParity::Even,
+                Terminals::OppositeSides => serpentine::RowParity::Odd,
+            },
             warnings,
         ),
         FillKind::WavySerpentine => {
