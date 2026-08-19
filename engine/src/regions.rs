@@ -296,18 +296,28 @@ pub struct Routed {
     pub link_length_mm: f64,
 }
 
+/// One routing request: the planned chain plus the trace parameters.
+pub struct RouteSpec<'a> {
+    pub chain: &'a Chain,
+    pub kind: FillKind,
+    pub pitch_mm: f64,
+    pub inset_mm: f64,
+    pub style: CornerStyle,
+    pub tab_in: &'a Pad,
+    pub tab_out: &'a Pad,
+}
+
 /// Fill every region and stitch the whole chain into one pad-to-pad path.
-#[allow(clippy::too_many_arguments)]
-pub fn route(
-    chain: &Chain,
-    kind: FillKind,
-    pitch_mm: f64,
-    inset_mm: f64,
-    style: CornerStyle,
-    tab_in: &Pad,
-    tab_out: &Pad,
-    warnings: &mut Vec<String>,
-) -> Result<Routed, EngineError> {
+pub fn route(spec: RouteSpec<'_>, warnings: &mut Vec<String>) -> Result<Routed, EngineError> {
+    let RouteSpec {
+        chain,
+        kind,
+        pitch_mm,
+        inset_mm,
+        style,
+        tab_in,
+        tab_out,
+    } = spec;
     let mut trace: Vec<PathSeg> = Vec::new();
     let mut link_indices: Vec<usize> = Vec::new();
     let mut link_len = 0.0;
@@ -319,13 +329,17 @@ pub fn route(
         let quarter = best_quarter(&region.polygon, region.target);
         let rotated = quarter.rotate_polygon(&region.polygon);
         let path = fills::fill(
-            kind,
-            &rotated,
-            pitch_mm,
-            inset_mm,
-            Reserve::none(),
-            style,
-            region.terminals,
+            fills::FillSpec {
+                kind,
+                outline: &rotated,
+                pitch_mm,
+                inset_mm,
+                // Tab keepouts are already cut out of the region, so the
+                // pattern may use all of what it is given.
+                reserve: Reserve::none(),
+                style,
+                terminals: region.terminals,
+            },
             warnings,
         )?;
         let path = quarter.inverse().rotate_path(&path);

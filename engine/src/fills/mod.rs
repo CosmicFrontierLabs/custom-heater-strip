@@ -91,20 +91,30 @@ pub enum Terminals {
     OppositeSides,
 }
 
+/// One fill request: which pattern, over what polygon, at what spacing.
+pub struct FillSpec<'a> {
+    pub kind: FillKind,
+    pub outline: &'a Polygon,
+    /// Centerline-to-centerline spacing.
+    pub pitch_mm: f64,
+    /// Clearance from the outline (edge margin + half trace width).
+    pub inset_mm: f64,
+    pub reserve: Reserve,
+    pub style: CornerStyle,
+    pub terminals: Terminals,
+}
+
 /// Route the heater trace with the requested pattern.
-///
-/// `pitch_mm` is the centerline-to-centerline spacing and `inset_mm` the
-/// clearance from the outline (edge margin + half trace width).
-pub fn fill(
-    kind: FillKind,
-    outline: &Polygon,
-    pitch_mm: f64,
-    inset_mm: f64,
-    reserve: Reserve,
-    style: CornerStyle,
-    terminals: Terminals,
-    warnings: &mut Vec<String>,
-) -> Result<Vec<PathSeg>, EngineError> {
+pub fn fill(spec: FillSpec<'_>, warnings: &mut Vec<String>) -> Result<Vec<PathSeg>, EngineError> {
+    let FillSpec {
+        kind,
+        outline,
+        pitch_mm,
+        inset_mm,
+        reserve,
+        style,
+        terminals,
+    } = spec;
     match kind {
         // Row count parity decides which side the last row ends on: an even
         // number of rows returns to the starting side, an odd number crosses.

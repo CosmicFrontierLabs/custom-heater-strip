@@ -205,13 +205,15 @@ fn design_from_svg(req: &DesignRequest) -> Result<Design, EngineError> {
     )?;
 
     let fill_path = fills::fill(
-        req.fill_kind,
-        &outline,
-        solved.pitch_mm,
-        inset,
-        plan.reserve,
-        req.corner_style,
-        fills::Terminals::SameSide,
+        fills::FillSpec {
+            kind: req.fill_kind,
+            outline: &outline,
+            pitch_mm: solved.pitch_mm,
+            inset_mm: inset,
+            reserve: plan.reserve,
+            style: req.corner_style,
+            terminals: fills::Terminals::SameSide,
+        },
         &mut warnings,
     )?;
 
@@ -317,13 +319,15 @@ fn design_from_geometry(req: &DesignRequest, spec: &GeometrySpec) -> Result<Desi
 
     let chain = regions::plan(&heaters, &tab_in, &tab_out, pad_clearance, &mut warnings)?;
     let routed = regions::route(
-        &chain,
-        req.fill_kind,
-        solved.pitch_mm,
-        inset,
-        req.corner_style,
-        &tab_in,
-        &tab_out,
+        regions::RouteSpec {
+            chain: &chain,
+            kind: req.fill_kind,
+            pitch_mm: solved.pitch_mm,
+            inset_mm: inset,
+            style: req.corner_style,
+            tab_in: &tab_in,
+            tab_out: &tab_out,
+        },
         &mut warnings,
     )?;
     let regions::Routed {
