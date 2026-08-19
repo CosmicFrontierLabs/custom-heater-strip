@@ -257,9 +257,10 @@ fn designer() -> Html {
         })
     };
 
-    // Clicking a polygon advances its role. The tab and outline roles are
-    // singular, so taking one clears whoever held it before — that way the
-    // selection is always valid by construction.
+    // Clicking a polygon advances its role, skipping over any singular role
+    // that another polygon already holds. Stealing the role instead would
+    // silently un-assign a tab the user had already placed, which is a
+    // surprising thing for a click on a different shape to do.
     let on_pick = {
         let roles = roles.clone();
         Callback::from(move |i: usize| {
@@ -267,13 +268,17 @@ fn designer() -> Html {
             if i >= next.len() {
                 return;
             }
-            let assigned = next[i].next();
-            if is_singular(assigned) {
-                for (j, r) in next.iter_mut().enumerate() {
-                    if j != i && *r == assigned {
-                        *r = PolygonRole::Unused;
-                    }
+            let held_elsewhere = |role: PolygonRole, next: &[PolygonRole]| {
+                is_singular(role) && next.iter().enumerate().any(|(j, r)| j != i && *r == role)
+            };
+            let mut assigned = next[i].next();
+            // Bounded by the number of roles, so this terminates even when
+            // every singular role is spoken for.
+            for _ in 0..PolygonRole::ALL.len() {
+                if !held_elsewhere(assigned, &next) {
+                    break;
                 }
+                assigned = assigned.next();
             }
             next[i] = assigned;
             roles.set(next);
