@@ -38,6 +38,8 @@ pub enum EngineError {
     NoDxfPolygons,
     #[error("geometry selection is incomplete: {0}")]
     BadGeometry(String),
+    #[error("could not package the gerber archive: {0}")]
+    Archive(String),
 }
 
 /// A point in board coordinates, millimeters, y-down (SVG convention).
@@ -154,17 +156,46 @@ pub struct Design {
     pub report: DesignReport,
 }
 
-/// Run the full pipeline: SVG outline → solved serpentine → fab outputs.
+/// Run the full pipeline: outline → solved trace → fab outputs.
+///
+/// The response is complete, archive included: nothing downstream has to
+/// finish assembling it, which is what lets the same call serve an HTTP
+/// handler or run directly in the browser.
 pub fn generate(req: &DesignRequest) -> Result<DesignResponse, EngineError> {
     let design = design(req)?;
+    let gerbers = gerber::render(&design);
+    let gerber_zip_base64 = zip_gerbers(&gerbers)?;
     Ok(DesignResponse {
         preview_svg: preview::render(&design),
         kicad_pcb: kicad::render(&design),
-        gerbers: gerber::render(&design),
-        // Filled in by the server, which owns archive packaging.
-        gerber_zip_base64: String::new(),
+        gerbers,
+        gerber_zip_base64,
         report: design.report,
     })
+}
+
+/// Bundle the gerber layer set into a base64-encoded zip, ready to hand
+/// straight to a browser download.
+fn zip_gerbers(
+    gerbers: &std::collections::BTreeMap<String, String>,
+) -> Result<String, EngineError> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in gerbers {
+            zip.start_file(name, opts)
+                .and_then(|()| zip.write_all(body.as_bytes()).map_err(Into::into))
+                .map_err(|e| EngineError::Archive(e.to_string()))?;
+        }
+        zip.finish()
+            .map_err(|e| EngineError::Archive(e.to_string()))?;
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(buf))
 }
 
 /// Solve the electrical + geometric design without generating output files.
@@ -796,6 +827,27 @@ mod tests {
             touches_pad,
             "expected the short to involve a pad feed: {shorts:?}"
         );
+    }
+
+    #[test]
+    fn the_gerber_zip_contains_every_layer() {
+        use base64::Engine as _;
+
+        let resp = generate(&rect_request()).unwrap();
+        assert!(
+            !resp.gerber_zip_base64.is_empty(),
+            "generate must return a finished archive"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&resp.gerber_zip_base64)
+            .unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        for expected in resp.gerbers.keys() {
+            assert!(names.contains(expected), "{expected} missing from zip");
+        }
     }
 
     #[test]
