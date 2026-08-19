@@ -1,6 +1,32 @@
+use frontend::{EngineTask, Task, TaskDone, WORKER_URL};
+use gloo_worker::Spawnable;
 use shared::{
     DesignRequest, DesignResponse, DxfPolygon, DxfUploadResponse, GeometrySpec, PolygonRole,
 };
+
+/// Hand one task to the engine worker and await its answer.
+///
+/// A fresh worker per call. `OneshotBridge::run` takes `&mut self`, so a
+/// bridge *could* be kept and reused; measured on a wavy serpentine (the
+/// heaviest fill), doing so would recover roughly 70 ms of main-thread time
+/// per design — worth having, but it needs a bridge held across awaits and
+/// the payoff is below the threshold where a click feels delayed, so it is
+/// left as a follow-up rather than bought with a `RefCell` borrow spanning an
+/// `await`. The Generate button is disabled while busy, so calls never
+/// overlap.
+///
+/// `spawn_with_loader`, not `spawn`: plain `spawn` wraps the path in a
+/// generated script and loads it from a **blob URL**, and a blob URL has an
+/// opaque base, so the shim's relative `importScripts("./worker.js")` fails
+/// with "The URL './worker.js' is invalid". Pointing the browser at the real
+/// shim URL keeps those relative paths resolvable — which is also what makes
+/// the whole thing work unchanged under the `/<repo>/` prefix on Pages.
+async fn run_in_worker(task: Task) -> TaskDone {
+    EngineTask::spawner()
+        .spawn_with_loader(WORKER_URL)
+        .run(task)
+        .await
+}
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -240,15 +266,18 @@ fn designer() -> Html {
             busy.set(true);
             spawn_local(async move {
                 match gloo_file::futures::read_as_bytes(&gloo_file::File::from(file)).await {
-                    // The engine runs here in the browser; the bytes never
-                    // leave the machine.
-                    Ok(bytes) => match engine::dxf::extract(&bytes) {
-                        Ok(d) => {
+                    // Parsed in a worker, on this machine; the bytes are never
+                    // uploaded anywhere.
+                    Ok(bytes) => match run_in_worker(Task::ParseDxf(bytes)).await {
+                        TaskDone::Dxf(d) => {
                             roles.set(d.polygons.iter().map(|p| p.suggested_role).collect());
-                            dxf.set(Some(d));
+                            dxf.set(Some(*d));
                             error.set(None);
                         }
-                        Err(e) => error.set(Some(e.to_string())),
+                        TaskDone::Failed(msg) => error.set(Some(msg)),
+                        TaskDone::Design(_) => {
+                            error.set(Some("worker returned the wrong result kind".into()))
+                        }
                     },
                     Err(e) => error.set(Some(format!("Could not read file: {e}"))),
                 }
@@ -355,17 +384,18 @@ fn designer() -> Html {
             let error = error.clone();
             let busy = busy.clone();
             busy.set(true);
-            // Yield once so the "Generating…" state paints before the engine
-            // takes the thread. Heavy fills still block it; that is what the
-            // Web Worker step of docs/frontend-only-plan.md fixes.
+            // Off to the worker: the UI keeps painting and stays clickable
+            // even while a wavy serpentine or a Hilbert fill is running.
             spawn_local(async move {
-                gloo_timers::future::TimeoutFuture::new(0).await;
-                match engine::generate(&req) {
-                    Ok(d) => {
+                match run_in_worker(Task::Design(Box::new(req))).await {
+                    TaskDone::Design(d) => {
                         error.set(None);
-                        result.set(Some(d));
+                        result.set(Some(*d));
                     }
-                    Err(e) => error.set(Some(e.to_string())),
+                    TaskDone::Failed(msg) => error.set(Some(msg)),
+                    TaskDone::Dxf(_) => {
+                        error.set(Some("worker returned the wrong result kind".into()))
+                    }
                 }
                 busy.set(false);
             });
