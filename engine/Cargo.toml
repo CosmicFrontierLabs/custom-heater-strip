@@ -16,3 +16,9 @@ cavalier_contours = "0.7.0"
 dxf = "0.6"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
+
+# `dxf` depends on `uuid`, which refuses to build for wasm without being told
+# where randomness comes from. We never generate a UUID; this just satisfies
+# the compile-time check.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["js"] }
