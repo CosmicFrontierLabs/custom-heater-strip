@@ -6,6 +6,7 @@
 //! and a numeric design report.
 
 mod fills;
+pub mod geom;
 mod gerber;
 mod kicad;
 mod outline;
@@ -311,6 +312,69 @@ mod tests {
                 err * 100.0
             );
         }
+    }
+
+    /// Every index pair in a design's trace that shorts, arcs handled exactly.
+    fn trace_shorts(d: &Design) -> Vec<(usize, usize)> {
+        let all: Vec<usize> = (0..d.trace.len()).collect();
+        geom::find_shorts(&d.trace, &all)
+    }
+
+    #[test]
+    fn routed_traces_do_not_short_against_themselves() {
+        for kind in shared::FillKind::ALL {
+            // Counterflow is known to short its feed run against the return
+            // arm at the pads; tracked in issue #5.
+            if kind == shared::FillKind::Counterflow {
+                continue;
+            }
+            let req = DesignRequest {
+                fill_kind: kind,
+                ..rect_request()
+            };
+            let d = design(&req).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let shorts = trace_shorts(&d);
+            assert!(
+                shorts.is_empty(),
+                "{kind:?}: {} self-short(s), first at segments {:?}",
+                shorts.len(),
+                shorts.first()
+            );
+        }
+    }
+
+    /// Pins the known counterflow defect (issue #5) to a specific pair of
+    /// segments rather than a screenshot. When the feed routing is fixed this
+    /// test fails: delete it and drop the skip in
+    /// `routed_traces_do_not_short_against_themselves`.
+    #[test]
+    fn counterflow_currently_shorts_its_feed_against_the_return_arm() {
+        let req = DesignRequest {
+            fill_kind: shared::FillKind::Counterflow,
+            ..rect_request()
+        };
+        let d = design(&req).unwrap();
+        let shorts = trace_shorts(&d);
+        assert!(
+            !shorts.is_empty(),
+            "counterflow no longer shorts — fold this pattern back into \
+             routed_traces_do_not_short_against_themselves and delete this test"
+        );
+        // The short is at the pads: one of the offending segments is a feed
+        // run touching a pad centre.
+        let pad_centres: Vec<Point> = d.pads.iter().map(|p| Point::new(p.cx, p.cy)).collect();
+        let touches_pad = shorts.iter().any(|(i, j)| {
+            [*i, *j].iter().any(|k| {
+                let s = &d.trace[*k];
+                pad_centres
+                    .iter()
+                    .any(|c| c.dist(&s.start()) < 1e-6 || c.dist(&s.end()) < 1e-6)
+            })
+        });
+        assert!(
+            touches_pad,
+            "expected the short to involve a pad feed: {shorts:?}"
+        );
     }
 
     #[test]
