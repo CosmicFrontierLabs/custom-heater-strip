@@ -233,6 +233,96 @@ pub const FAB_PRESETS: &[FabPreset] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// DXF geometry API
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /api/dxf`: an uploaded DXF to extract polygons from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DxfUploadRequest {
+    /// The DXF file, base64-encoded (handles both ASCII and binary DXF).
+    pub dxf_base64: String,
+}
+
+/// One closed ring pulled out of a DXF, in board mm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DxfPolygon {
+    /// Stable index used by the picker to address this polygon.
+    pub id: u32,
+    /// DXF layer the entity came from.
+    pub layer: String,
+    /// Source entity type, shown in the picker ("LWPOLYLINE", "CIRCLE", …).
+    pub kind: String,
+    /// Closed ring in mm, y-down, translated so the drawing starts at (0,0).
+    pub points: Vec<[f64; 2]>,
+    pub area_mm2: f64,
+    /// Role guessed from the layer name; the user can override it.
+    pub suggested_role: PolygonRole,
+}
+
+/// Response body for `POST /api/dxf`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DxfUploadResponse {
+    pub polygons: Vec<DxfPolygon>,
+    /// The `$INSUNITS` value the coordinates were scaled from.
+    pub units: String,
+    pub warnings: Vec<String>,
+}
+
+/// What a DXF polygon contributes to the design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PolygonRole {
+    /// Ignored entirely (construction lines, dimensions, title block…).
+    #[default]
+    Unused,
+    /// The board profile on Edge.Cuts. Defaults to the heaters' bounds.
+    Outline,
+    /// A region to fill with heater trace.
+    Heater,
+    /// The supply-side solder tab; its polygon becomes the pad copper.
+    TabIn,
+    /// The return-side solder tab.
+    TabOut,
+}
+
+impl PolygonRole {
+    /// Click-cycle order in the picker.
+    pub const ALL: [PolygonRole; 5] = [
+        PolygonRole::Unused,
+        PolygonRole::Heater,
+        PolygonRole::TabIn,
+        PolygonRole::TabOut,
+        PolygonRole::Outline,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            PolygonRole::Unused => "Unused",
+            PolygonRole::Outline => "Board outline",
+            PolygonRole::Heater => "Heater region",
+            PolygonRole::TabIn => "Tab (in)",
+            PolygonRole::TabOut => "Tab (out)",
+        }
+    }
+
+    /// Colour the picker draws this role in (also used in the legend).
+    pub fn color(&self) -> &'static str {
+        match self {
+            PolygonRole::Unused => "#565f89",
+            PolygonRole::Outline => "#bb9af7",
+            PolygonRole::Heater => "#d98f3d",
+            PolygonRole::TabIn => "#9ece6a",
+            PolygonRole::TabOut => "#7dcfff",
+        }
+    }
+
+    /// Next role when the user clicks a polygon.
+    pub fn next(&self) -> PolygonRole {
+        let i = Self::ALL.iter().position(|r| r == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
 /// Computed electrical + geometric summary of a generated heater design.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesignReport {
