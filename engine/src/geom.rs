@@ -44,10 +44,7 @@ fn is_endpoint(s: &PathSeg, p: Point) -> bool {
 
 /// Is `p`, already known to lie on the segment's circle, within its sweep?
 fn arc_contains(arc: &PathSeg, p: Point) -> bool {
-    let PathSeg::Arc {
-        a, center, ccw, ..
-    } = arc
-    else {
+    let PathSeg::Arc { a, center, ccw, .. } = arc else {
         return false;
     };
     let ang = |q: &Point| (q.y - center.y).atan2(q.x - center.x);
