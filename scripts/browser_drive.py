@@ -109,6 +109,20 @@ class Session:
             raise RuntimeError(f"eval threw: {r['exceptionDetails']}")
         return r.get("result", {}).get("value")
 
+    async def wait_for_load(self, timeout=30.0):
+        """Block until the page fires its load event."""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                msg = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=0.2))
+            except asyncio.TimeoutError:
+                continue
+            self.note(msg)
+            if msg.get("method") == "Page.loadEventFired":
+                return True
+        print("warning: load event never fired")
+        return False
+
     async def drain(self, seconds):
         """Pump events for a while so console/exception logs are captured."""
         end = time.time() + seconds
@@ -132,7 +146,9 @@ async def main():
     import websockets
 
     port = 9333
-    with tempfile.TemporaryDirectory() as user_dir:
+    # Chromium keeps writing to its profile as it exits; do not let a
+    # cleanup race mask the run's result.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as user_dir:
         proc = launch(port, user_dir)
         try:
             ws_url = page_ws(port)
@@ -142,8 +158,13 @@ async def main():
                 await s.call("Log.enable")
                 await s.call("Page.enable")
                 await s.call("Page.navigate", url=args.url)
-                # Let the wasm bundle fetch, compile and mount.
-                await s.drain(4.0)
+                # Wait for the load event before evaluating anything. Without
+                # this, Runtime.evaluate can land in the previous (about:blank)
+                # execution context and report an empty document — which looks
+                # exactly like an app that failed to mount.
+                await s.wait_for_load(timeout=args.timeout)
+                # Then let the wasm bundle fetch, compile and mount.
+                await s.drain(2.0)
 
                 if args.wait_for:
                     deadline = time.time() + args.timeout
@@ -163,6 +184,10 @@ async def main():
                     out = await s.eval(f"(async () => {{ {body} }})()")
                     print("SCRIPT RESULT:", json.dumps(out, indent=2)[:4000])
                     await s.drain(1.0)
+
+                body = await s.eval("document.body.innerHTML.length", await_promise=False)
+                title = await s.eval("document.title", await_promise=False)
+                print(f"document.title={title!r} body.innerHTML length={body}")
 
                 if args.shot:
                     r = await s.call("Page.captureScreenshot", captureBeyondViewport=True)
