@@ -334,6 +334,7 @@ dependencies = [
  "engine",
  "gloo-file 0.3.0",
  "gloo-timers 0.3.0",
+ "gloo-worker 0.4.0",
  "js-sys",
  "serde",
  "serde_json",

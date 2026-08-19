@@ -3,6 +3,19 @@ name = "frontend"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "frontend"
+path = "src/lib.rs"
+
+# Two wasm binaries: the Yew app, and the Web Worker that owns the engine.
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
 yew-router = "0.18"
@@ -16,3 +29,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shared = { path = "../shared" }
 engine = { version = "0.1.0", path = "../engine" }
+gloo-worker = { version = "0.4", features = ["futures"] }
