@@ -249,17 +249,32 @@ fn design_from_svg(req: &DesignRequest) -> Result<Design, EngineError> {
     )?;
 
     // Full electrical path: pad A → feed → fill pattern → feed → pad B.
-    // Corner-exit patterns route via the full-height left lane; center-exit
-    // patterns (spiral, concentric) via the pocket-internal right lane.
-    let lane = match req.fill_kind {
-        shared::FillKind::DoubleSpiral | shared::FillKind::Concentric => terminals::Lane::Right,
-        _ => terminals::Lane::Left,
-    };
     let row_start = fill_path.first().expect("nonempty path").start();
     let row_end = fill_path.last().expect("nonempty path").end();
-    let mut trace = plan.feed_start(lane, row_start);
+    let (feed_in, feed_out) = match req.fill_kind {
+        // The bifilar pattern finishes with both arms side by side, one pitch
+        // apart, so a single shared lane would run the two feeds on top of
+        // each other. Nested lanes instead.
+        shared::FillKind::Counterflow => plan.feeds_adjacent(row_start, row_end),
+        // Center-exit patterns leave from inside the pocket, so they use the
+        // pocket-internal right lane; everything else uses the full-height
+        // corridor left of the pads.
+        kind => {
+            let lane = match kind {
+                shared::FillKind::DoubleSpiral | shared::FillKind::Concentric => {
+                    terminals::Lane::Right
+                }
+                _ => terminals::Lane::Left,
+            };
+            (
+                plan.feed_start(lane, row_start),
+                plan.feed_end(lane, row_end),
+            )
+        }
+    };
+    let mut trace = feed_in;
     trace.extend(fill_path);
-    trace.extend(plan.feed_end(lane, row_end));
+    trace.extend(feed_out);
     let length_mm: f64 = trace.iter().map(|s| s.length()).sum();
 
     let refined = solver::refine(req, &solved, length_mm, &mut warnings);
@@ -775,11 +790,6 @@ mod tests {
     #[test]
     fn routed_traces_do_not_short_against_themselves() {
         for kind in shared::FillKind::ALL {
-            // Counterflow is known to short its feed run against the return
-            // arm at the pads; tracked in issue #5.
-            if kind == shared::FillKind::Counterflow {
-                continue;
-            }
             let req = DesignRequest {
                 fill_kind: kind,
                 ..rect_request()
@@ -795,37 +805,38 @@ mod tests {
         }
     }
 
-    /// Documents the known counterflow defect so the diagnosis stays pinned to
-    /// a specific pair of segments rather than a screenshot. Flip this to the
-    /// clean assertion in `routed_traces_do_not_short_against_themselves`
-    /// once the feed routing is fixed.
+    /// The bifilar feeds must be *nested*, not overlaid. Before this was fixed
+    /// they shared one lane `x`, which left the two runs collinear on top of
+    /// each other for the whole height of the board -- so assert the two
+    /// vertical traversals sit at genuinely different, manufacturably-spaced x.
     #[test]
-    fn counterflow_currently_shorts_its_feed_against_the_return_arm() {
+    fn counterflow_feeds_run_in_two_separate_lanes() {
         let req = DesignRequest {
             fill_kind: shared::FillKind::Counterflow,
             ..rect_request()
         };
         let d = design(&req).unwrap();
-        let shorts = trace_shorts(&d);
-        assert!(
-            !shorts.is_empty(),
-            "counterflow no longer shorts — fold this pattern back into \
-             routed_traces_do_not_short_against_themselves and delete this test"
-        );
-        // The short is at the pads: one of the offending segments is a feed
-        // run touching a pad centre.
-        let pad_centres: Vec<Point> = d.pads.iter().map(|p| p.center()).collect();
-        let touches_pad = shorts.iter().any(|(i, j)| {
-            [*i, *j].iter().any(|k| {
-                let s = &d.trace[*k];
-                pad_centres
-                    .iter()
-                    .any(|c| c.dist(&s.start()) < 1e-6 || c.dist(&s.end()) < 1e-6)
+        let pitch = d.report.trace_width_mm + d.report.trace_gap_mm;
+
+        // The tall vertical runs are the lane traversals.
+        let mut lanes: Vec<f64> = d
+            .trace
+            .iter()
+            .filter_map(|s| match s {
+                PathSeg::Line { a, b } if (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() > 5.0 => {
+                    Some(a.x)
+                }
+                _ => None,
             })
-        });
+            .collect();
+        lanes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        lanes.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        assert_eq!(lanes.len(), 2, "expected two distinct lanes, got {lanes:?}");
+        let separation = lanes[1] - lanes[0];
         assert!(
-            touches_pad,
-            "expected the short to involve a pad feed: {shorts:?}"
+            separation >= pitch - 1e-9,
+            "lanes {separation:.4} mm apart, tighter than the {pitch:.4} mm \
+             routing pitch the fab can hold"
         );
     }
 

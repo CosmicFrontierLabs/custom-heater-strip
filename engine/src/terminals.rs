@@ -138,6 +138,10 @@ pub struct TerminalPlan {
     pub pads: [PadRect; 2],
     x_left: f64,
     x_right: f64,
+    /// Two nested lanes inside the left corridor, one routing pitch apart,
+    /// for patterns whose two path ends come back adjacent to each other.
+    lane_inner: f64,
+    lane_outer: f64,
 }
 
 pub fn layout(
@@ -190,6 +194,15 @@ pub fn layout(
     let px0 = x0 + lane;
     let pcx = px0 + pad_w / 2.0;
 
+    // Two lanes stepping back from the fill's left edge one routing pitch at a
+    // time. A pitch is by definition the spacing the fab can hold between
+    // adjacent traces, so this needs no extra clearance rule. Both stay right
+    // of `x0` because `lane` is itself at least two pitches wide.
+    let pitch = trace_width_mm + gap_mm;
+    let lane_inner = px0 - pitch;
+    let lane_outer = px0 - 2.0 * pitch;
+    debug_assert!(lane_outer >= x0 - 1e-9, "nested lanes escape the corridor");
+
     Ok(TerminalPlan {
         reserve: Reserve {
             lane_edge: px0,
@@ -213,6 +226,8 @@ pub fn layout(
         ],
         x_left: x0 + lane / 2.0,
         x_right: px0 + pad_w + lane / 2.0,
+        lane_inner,
+        lane_outer,
     })
 }
 
@@ -246,6 +261,75 @@ impl TerminalPlan {
             Point::new(x, b.cy),
             Point::new(b.cx, b.cy),
         ])
+    }
+
+    /// Feeds for a pattern whose two path ends come back **adjacent** to each
+    /// other rather than at opposite corners — the bifilar counterflow, whose
+    /// whole point is that its two arms finish side by side.
+    ///
+    /// [`feed_start`](Self::feed_start) and [`feed_end`](Self::feed_end) cannot
+    /// serve that case: they share one lane `x`, so with both terminals a
+    /// single pitch apart the two runs end up **collinear**, sitting on top of
+    /// each other for the whole height of the board rather than merely
+    /// touching.
+    ///
+    /// The fix is to nest the two routes instead of overlapping them. The
+    /// terminal farther from the pads takes the outer lane and the farther
+    /// pad; the nearer terminal takes the inner lane and the nearer pad. One
+    /// route then encloses the other without ever meeting it:
+    ///
+    /// ```text
+    ///   t_far  ─────────────────┐   outer lane
+    ///   t_near ───────────┐     │   inner lane
+    ///                     │     │
+    ///        pad_near ────┘     │
+    ///        pad_far  ──────────┘
+    /// ```
+    ///
+    /// Returns `(feed_start, feed_end)`: the first runs pad → `t_start`, the
+    /// second `t_end` → pad, so they bracket the fill in trace order.
+    pub fn feeds_adjacent(&self, t_start: Point, t_end: Point) -> (Vec<PathSeg>, Vec<PathSeg>) {
+        let pad_mid = (self.pads[0].cy + self.pads[1].cy) / 2.0;
+        let t_mid = (t_start.y + t_end.y) / 2.0;
+
+        // Which terminal is farther out, and which pad is farther away. Those
+        // two go together on the outer lane; nesting is what avoids crossings.
+        let start_is_far = (t_start.y - pad_mid).abs() >= (t_end.y - pad_mid).abs();
+        let pad0_is_far = (self.pads[0].cy - t_mid).abs() >= (self.pads[1].cy - t_mid).abs();
+
+        let (t_far, t_near) = if start_is_far {
+            (t_start, t_end)
+        } else {
+            (t_end, t_start)
+        };
+        let (pad_far, pad_near) = if pad0_is_far {
+            (self.pads[0], self.pads[1])
+        } else {
+            (self.pads[1], self.pads[0])
+        };
+
+        // pad → lane → terminal, as three orthogonal hops.
+        let leg = |pad: PadRect, x: f64, t: Point| {
+            [
+                Point::new(pad.cx, pad.cy),
+                Point::new(x, pad.cy),
+                Point::new(x, t.y),
+                t,
+            ]
+        };
+        let far_leg = leg(pad_far, self.lane_outer, t_far);
+        let near_leg = leg(pad_near, self.lane_inner, t_near);
+
+        // `feed_start` must arrive at t_start; `feed_end` must leave t_end, so
+        // whichever leg belongs to t_end is walked backwards.
+        let (to_start, to_end) = if start_is_far {
+            (far_leg, near_leg)
+        } else {
+            (near_leg, far_leg)
+        };
+        let mut reversed = to_end;
+        reversed.reverse();
+        (segments(&to_start), segments(&reversed))
     }
 }
 
