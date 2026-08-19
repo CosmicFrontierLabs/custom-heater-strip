@@ -58,6 +58,26 @@ impl Polygon {
             || self.points.iter().any(|p| other.contains(*p))
     }
 
+    /// Distance from `p` to the nearest point on this ring, ignoring which
+    /// side of it `p` is on.
+    pub fn distance_to_boundary(&self, p: Point) -> f64 {
+        let n = self.points.len();
+        (0..n)
+            .map(|i| point_segment_distance(p, self.points[i], self.points[(i + 1) % n]))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Signed clearance from `p` to the boundary: positive inside, negative
+    /// outside. This is what tells you whether copper of a given width fits.
+    pub fn clearance(&self, p: Point) -> f64 {
+        let d = self.distance_to_boundary(p);
+        if self.contains(p) {
+            d
+        } else {
+            -d
+        }
+    }
+
     pub fn bbox(&self) -> (Point, Point) {
         let mut min = Point::new(f64::INFINITY, f64::INFINITY);
         let mut max = Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -140,6 +160,18 @@ impl Polygon {
             pieces,
         })
     }
+}
+
+/// Distance from `p` to segment `a`–`b`.
+fn point_segment_distance(p: Point, a: Point, b: Point) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-18 {
+        return p.dist(&a);
+    }
+    // Projection parameter, clamped to the segment.
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    p.dist(&Point::new(a.x + t * dx, a.y + t * dy))
 }
 
 fn signed_area(pts: &[Point]) -> f64 {

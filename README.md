@@ -1,8 +1,30 @@
 # custom-heater-strip
 
-Design custom resistive heater strips as flex PCBs, entirely in your browser.
-Give it an outline, specify your electrical budget (supply voltage, target
-wattage, current ceiling), and get back a fab-ready copper trace:
+Turn any outline into a fab-ready resistive heater on flex PCB — in your
+browser, with no server and nothing uploaded.
+
+### ▶ [Try it: www.cosmicfrontier.org/custom-heater-strip](https://www.cosmicfrontier.org/custom-heater-strip/)
+
+<p align="center">
+  <img src="docs/hero-s.svg" alt="A heater trace routed into the shape of a letter S: concentric copper rings following the letter's outline, with two solder pads and a silkscreen legend reading 12V 12.00OHM 12.0W MAX" width="380">
+</p>
+
+That is a real design, not an illustration: a letter **S**, 76 × 116 mm,
+asked for 12 W at 12 V and routed to **12.00 Ω** — dead on target — as a
+0.57 mm trace 6.9 m long over 65.3 cm², at 0.18 W/cm². Reproduce it with:
+
+```sh
+cargo run -p engine --example hero > docs/hero-s.svg
+```
+
+It uses the **concentric** fill, because the S is exactly the case that needs
+it: the scanline patterns place their solder pocket and feed lanes from the
+outline's *bounding box*, which on a concave shape can put copper off the
+board entirely. The engine now refuses those designs instead of emitting
+them, and points you at the outline-following patterns.
+
+Give it an outline and an electrical budget (supply voltage, target wattage,
+current ceiling), and you get:
 
 - **SVG preview** rendered live
 - **KiCad board file** (`.kicad_pcb`) to open and tweak
@@ -11,8 +33,17 @@ wattage, current ceiling), and get back a fab-ready copper trace:
 - **Design report** — target vs. achieved resistance, operating current and
   headroom, trace width/gap/length, power density
 
-There is no server. The design engine is compiled to WebAssembly and runs on
-your machine, so **your board geometry is never uploaded anywhere**.
+The design engine is compiled to WebAssembly and runs in a Web Worker on your
+own machine, so **your board geometry is never uploaded anywhere** and the tab
+stays responsive even on the heaviest fills.
+
+## The app
+
+![the designer: a DXF uploaded and its polygons tagged as heater regions and solder tabs, the routed three-region result, and the design report](docs/app-screenshot.png)
+
+Upload a DXF, click its polygons to say what each one is, and generate. Above,
+three heater lobes chained in series between two round solder tabs, hitting
+14.40 Ω on a 14.40 Ω target.
 
 ## Geometry: three ways in
 
@@ -35,6 +66,9 @@ DXF entities read: `LWPOLYLINE` and `POLYLINE` (including bulge arcs),
 
 ## Quick start
 
+Nothing to install — [use the hosted
+app](https://www.cosmicfrontier.org/custom-heater-strip/). To run it locally:
+
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install trunk --locked
@@ -43,7 +77,9 @@ cd frontend && trunk serve
 # -> http://localhost:8080
 ```
 
-That is the whole toolchain — no database, no container, no services.
+That is the whole toolchain — no database, no container, no services. It
+deploys to GitHub Pages straight from `main`; `Tests`, `Clippy` and `Rustfmt`
+are required to merge.
 
 ## Architecture
 
@@ -94,8 +130,16 @@ both ends at the terminal zone (see docs/fill-patterns.md for the research):
 - **Concentric** — outline insets (cavalier_contours) spliced through a
   channel at the left; best coverage of irregular outlines
 
-Routed traces are checked for self-intersection with exact arc geometry, so a
-pattern that would short against itself is caught rather than shipped.
+Two invariants are checked on every routed trace, with exact arc geometry
+rather than chord approximations:
+
+- **No self-intersection** — copper touching copper anywhere it should not,
+  including the collinear-overlap case where two runs sit on top of each other
+  rather than merely crossing.
+- **Nothing off the board** — the trace is sampled along its true arcs and its
+  *edge*, half a trace-width off the centreline, must stay inside the outline.
+
+Both are hard failures, not warnings. A design that violates them is refused.
 
 ## Reuse from [pastebom.com](https://github.com/meawoppl/pastebom.com)
 
@@ -111,10 +155,11 @@ KiCad code is read-only — no writers to lift. What this project borrows:
 
 ## Current limitations / roadmap
 
-- Heavy fills (wavy serpentine, Hilbert on a large board) block the UI thread;
-  moving the engine into a Web Worker is planned — see
-  docs/frontend-only-plan.md
-- The counterflow pattern shorts against its own pad feed
+- The scanline patterns (serpentine, wavy, counterflow) place their solder
+  pocket and feed lanes from the outline's **bounding box**, so on a concave
+  outline they can put copper off the board. This is now detected and the
+  design refused rather than emitted — use the concentric or double-spiral
+  fill for shaped boards, or see the open issue for the proper fix
 - Concave outlines route only the widest section per row (a warning tells you
   when this happens); holes/cutouts are not yet supported
 - Links between heater regions are straight runs; when a tab sits far from the

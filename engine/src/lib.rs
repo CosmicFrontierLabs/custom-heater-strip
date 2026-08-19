@@ -278,6 +278,13 @@ fn design_from_svg(req: &DesignRequest) -> Result<Design, EngineError> {
     let length_mm: f64 = trace.iter().map(|s| s.length()).sum();
 
     let refined = solver::refine(req, &solved, length_mm, &mut warnings);
+    check_on_board(
+        &trace,
+        &outline,
+        refined.width_mm,
+        req.edge_margin_mm,
+        &mut warnings,
+    )?;
 
     let mut report = DesignReport {
         target_resistance_ohms: refined.target_resistance_ohms,
@@ -412,6 +419,14 @@ fn design_from_geometry(req: &DesignRequest, spec: &GeometrySpec) -> Result<Desi
         ),
     };
 
+    check_on_board(
+        &trace,
+        &outline,
+        refined.width_mm,
+        req.edge_margin_mm,
+        &mut warnings,
+    )?;
+
     if link_length_mm > 0.25 * length_mm {
         warnings.push(format!(
             "{:.0}% of the trace length is interconnect between regions and \
@@ -452,6 +467,59 @@ fn design_from_geometry(req: &DesignRequest, spec: &GeometrySpec) -> Result<Desi
         silk,
         report,
     })
+}
+
+/// Reject a routed trace whose copper does not fit on the board, and warn when
+/// it fits but tighter than asked for.
+///
+/// This is not a theoretical check. The terminal pocket and feed lanes are
+/// placed from the outline's *bounding box*, which silently assumes the
+/// outline fills it — true for a rectangle, false for anything concave. On a
+/// letter-S outline the serpentine's feed lane ran 10 mm off the board,
+/// through the empty space beside the lower stroke, and every output file was
+/// produced without complaint.
+fn check_on_board(
+    trace: &[PathSeg],
+    outline: &Polygon,
+    width_mm: f64,
+    edge_margin_mm: f64,
+    warnings: &mut Vec<String>,
+) -> Result<(), EngineError> {
+    // Copper physically leaving the board: unmanufacturable, so refuse it.
+    let off = geom::find_escapes(trace, outline, width_mm, 0.0);
+    if let Some(worst) = off
+        .iter()
+        .min_by(|a, b| a.clearance_mm.partial_cmp(&b.clearance_mm).unwrap())
+    {
+        return Err(EngineError::Infeasible(format!(
+            "the routed trace leaves the board outline at ({:.2}, {:.2}) mm, by \
+             {:.2} mm, in {} place(s). The terminal pocket and feed lanes are \
+             laid out from the outline's bounding box, so a concave outline can \
+             put them off the board — try the concentric or double-spiral fill, \
+             which route from the outline itself.",
+            worst.at.x,
+            worst.at.y,
+            -worst.clearance_mm,
+            off.len()
+        )));
+    }
+
+    // On the board, but closer to the edge than the requested margin.
+    let tight = geom::find_escapes(trace, outline, width_mm, edge_margin_mm);
+    if let Some(worst) = tight
+        .iter()
+        .min_by(|a, b| a.clearance_mm.partial_cmp(&b.clearance_mm).unwrap())
+    {
+        warnings.push(format!(
+            "trace comes within {:.3} mm of the board edge at ({:.2}, {:.2}) mm, \
+             inside the {edge_margin_mm:.2} mm margin requested ({} place(s))",
+            worst.clearance_mm - width_mm / 2.0,
+            worst.at.x,
+            worst.at.y,
+            tight.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Axis-aligned box around a set of polygons, grown by `margin_mm`.
@@ -838,6 +906,99 @@ mod tests {
             "lanes {separation:.4} mm apart, tighter than the {pitch:.4} mm \
              routing pitch the fab can hold"
         );
+    }
+
+    /// A letter S: deeply concave, but concave in the way the scanline fill
+    /// handles — every row crosses exactly one span of the shape.
+    fn letter_s_svg() -> String {
+        let (w, h, t) = (76.0, 116.0, 24.0);
+        let (my0, my1) = ((h - t) / 2.0, (h - t) / 2.0 + t);
+        let pts = [
+            (0.0, 0.0),
+            (w, 0.0),
+            (w, t),
+            (t, t),
+            (t, my0),
+            (w, my0),
+            (w, h),
+            (0.0, h),
+            (0.0, h - t),
+            (w - t, h - t),
+            (w - t, my1),
+            (0.0, my1),
+        ];
+        let d: String = pts
+            .iter()
+            .enumerate()
+            .map(|(i, (x, y))| format!("{}{x} {y}", if i == 0 { 'M' } else { 'L' }))
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"><path d="{d}Z"/></svg>"##
+        )
+    }
+
+    #[test]
+    fn copper_stays_on_the_board_for_every_pattern() {
+        for kind in shared::FillKind::ALL {
+            let d = design(&DesignRequest {
+                fill_kind: kind,
+                ..rect_request()
+            })
+            .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let escapes = geom::find_escapes(&d.trace, &d.outline, d.trace_width_mm, 0.0);
+            assert!(
+                escapes.is_empty(),
+                "{kind:?}: copper leaves the board in {} place(s), worst {:?}",
+                escapes.len(),
+                escapes
+                    .iter()
+                    .min_by(|a, b| a.clearance_mm.partial_cmp(&b.clearance_mm).unwrap())
+            );
+        }
+    }
+
+    /// The bounding-box terminal placement puts the pocket and feed lanes off
+    /// the board on a concave outline. That must be refused, not shipped: for
+    /// a long time the letter-S serpentine emitted a full set of fab files
+    /// with its feed lane running 10 mm beside the board.
+    #[test]
+    fn a_concave_outline_that_pushes_copper_off_the_board_is_rejected() {
+        let req = DesignRequest {
+            svg: letter_s_svg(),
+            watts: 12.0,
+            edge_margin_mm: 0.6,
+            fill_kind: shared::FillKind::Serpentine,
+            ..rect_request()
+        };
+        match design(&req) {
+            Err(EngineError::Infeasible(msg)) => {
+                assert!(msg.contains("leaves the board outline"), "{msg}");
+            }
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("off-board copper was accepted"),
+        }
+    }
+
+    /// The outline-following patterns handle the same shape correctly, which is
+    /// what the rejection message tells the user to reach for.
+    #[test]
+    fn outline_following_patterns_route_the_letter_s_cleanly() {
+        for kind in [shared::FillKind::Concentric, shared::FillKind::DoubleSpiral] {
+            let d = design(&DesignRequest {
+                svg: letter_s_svg(),
+                watts: 12.0,
+                edge_margin_mm: 0.6,
+                fill_kind: kind,
+                ..rect_request()
+            })
+            .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            assert!(
+                geom::find_escapes(&d.trace, &d.outline, d.trace_width_mm, 0.0).is_empty(),
+                "{kind:?} put copper off the board"
+            );
+            assert!(trace_shorts(&d).is_empty(), "{kind:?} shorts");
+        }
     }
 
     #[test]

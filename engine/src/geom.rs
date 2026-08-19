@@ -205,6 +205,70 @@ fn arc_arc(a: &PathSeg, b: &PathSeg) -> Vec<Point> {
     out
 }
 
+/// Somewhere the copper does not fit inside the board.
+#[derive(Debug, Clone, Copy)]
+pub struct Escape {
+    /// Index of the offending trace segment.
+    pub seg: usize,
+    /// The sampled centreline point that is too close to (or past) the edge.
+    pub at: Point,
+    /// Signed clearance from the outline: positive inside, negative outside.
+    pub clearance_mm: f64,
+}
+
+/// Points sampled along each segment when checking containment. An arc bulges
+/// away from its chord, so its endpoints alone would miss exactly the place a
+/// turnaround is most likely to push past an edge.
+const SAMPLES_PER_SEG: usize = 8;
+
+/// Find every place the trace's copper leaves the board, or comes closer to the
+/// edge than half its own width.
+///
+/// A centreline inside the outline is not sufficient: the trace is
+/// `trace_width_mm` wide, so its *edge* is half that off the centreline, and a
+/// centreline sitting exactly on the boundary means half the copper hangs off
+/// the board. `margin_mm` is required clearance beyond that half-width.
+pub fn find_escapes(
+    trace: &[PathSeg],
+    outline: &crate::Polygon,
+    trace_width_mm: f64,
+    margin_mm: f64,
+) -> Vec<Escape> {
+    let need = trace_width_mm / 2.0 + margin_mm;
+    let mut out = Vec::new();
+    for (i, seg) in trace.iter().enumerate() {
+        let mut worst: Option<Escape> = None;
+        for k in 0..=SAMPLES_PER_SEG {
+            let t = k as f64 / SAMPLES_PER_SEG as f64;
+            let p = sample(seg, t);
+            let clearance = outline.clearance(p);
+            if clearance < need && worst.is_none_or(|w| clearance < w.clearance_mm) {
+                worst = Some(Escape {
+                    seg: i,
+                    at: p,
+                    clearance_mm: clearance,
+                });
+            }
+        }
+        out.extend(worst);
+    }
+    out
+}
+
+/// Point a fraction `t` along a segment, following the true arc.
+fn sample(seg: &PathSeg, t: f64) -> Point {
+    match seg {
+        PathSeg::Line { a, b } => Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t),
+        PathSeg::Arc { a, center, ccw, .. } => {
+            let r = seg.radius();
+            let a0 = (a.y - center.y).atan2(a.x - center.x);
+            let swept = seg.sweep() * t;
+            let ang = if *ccw { a0 + swept } else { a0 - swept };
+            Point::new(center.x + r * ang.cos(), center.y + r * ang.sin())
+        }
+    }
+}
+
 /// Every pair of segments in `trace` that shorts against another, ignoring
 /// pairs that merely share an endpoint. Returns index pairs, `i < j`.
 ///
