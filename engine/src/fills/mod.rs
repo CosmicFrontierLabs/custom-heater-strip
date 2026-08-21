@@ -108,7 +108,8 @@ pub fn scanline_coverage(outline: &Polygon, pitch_mm: f64, inset_mm: f64, reserv
         let bound = reserve.left_bound(y);
         let spans: Vec<f64> = outline
             .scanline_hits(y)
-            .chunks_exact(2)
+            .chunks(2)
+            .filter(|c| c.len() == 2)
             .map(|c| ((c[0] + inset_mm).max(bound), c[1] - inset_mm))
             .filter(|(a, b)| b > a)
             .map(|(a, b)| b - a)
@@ -147,8 +148,8 @@ pub fn reserved_area(outline: &Polygon, pitch_mm: f64, inset_mm: f64, reserve: R
     let mut y = y_lo;
     while y <= y_hi {
         let bound = reserve.left_bound(y);
-        for c in outline.scanline_hits(y).chunks_exact(2) {
-            let (a, b) = (c[0], c[1]);
+        for c in outline.scanline_hits(y).chunks(2) {
+            let [a, b] = *c else { continue };
             // How much of this span lies left of the bound.
             blocked += (bound.min(b) - a).clamp(0.0, b - a);
         }

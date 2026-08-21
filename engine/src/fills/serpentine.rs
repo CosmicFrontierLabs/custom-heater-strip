@@ -73,7 +73,8 @@ pub fn fill(
         // and pushed right of the terminal reserve at this height.
         let bound = reserve.left_bound(y);
         let mut spans: Vec<(f64, f64)> = hits
-            .chunks_exact(2)
+            .chunks(2)
+            .filter(|c| c.len() == 2)
             .map(|c| ((c[0] + inset_mm).max(bound), c[1] - inset_mm))
             .filter(|(a, b)| b > a)
             .collect();
