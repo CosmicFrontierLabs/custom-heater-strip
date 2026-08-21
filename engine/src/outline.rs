@@ -58,6 +58,11 @@ impl Polygon {
             || self.points.iter().any(|p| other.contains(*p))
     }
 
+    /// Is every point of `other` inside this polygon?
+    pub fn contains_polygon(&self, other: &Polygon) -> bool {
+        other.points.iter().all(|p| self.contains(*p))
+    }
+
     /// Distance from `p` to the nearest point on this ring, ignoring which
     /// side of it `p` is on.
     pub fn distance_to_boundary(&self, p: Point) -> f64 {
@@ -118,6 +123,70 @@ pub struct Subtraction {
     pub pieces: usize,
 }
 
+/// Convert to a cavalier_contours polyline, wound counter-clockwise as its
+/// boolean ops expect.
+fn to_pline(poly: &Polygon) -> cavalier_contours::polyline::Polyline {
+    use cavalier_contours::polyline::{PlineSource, PlineSourceMut, Polyline};
+    let mut pl = Polyline::new_closed();
+    for p in &poly.points {
+        pl.add(p.x, p.y, 0.0);
+    }
+    if pl.area() < 0.0 {
+        pl.invert_direction_mut();
+    }
+    pl
+}
+
+fn from_pline(pl: &cavalier_contours::polyline::Polyline) -> Polygon {
+    use cavalier_contours::polyline::PlineSource;
+    let flat = pl.arcs_to_approx_lines(0.01).unwrap_or_else(|| pl.clone());
+    Polygon {
+        points: (0..flat.vertex_count())
+            .map(|i| {
+                let v = flat.at(i);
+                Point::new(v.x, v.y)
+            })
+            .collect(),
+    }
+}
+
+/// The union of a set of polygons, largest piece first.
+///
+/// Built on [`crate::arrangement`] rather than a boolean `Or`, because the
+/// case that matters most here is the one boolean ops get wrong: two polygons
+/// sharing an edge exactly have a zero-area intersection, so `Or` reports them
+/// as disjoint. Since "contiguous" for a heater selection means precisely
+/// "abutting", that is the common case, not a corner one.
+///
+/// Feeding every edge to the arrangement sidesteps it entirely. Shared walls
+/// appear twice, collapse to one edge, and end up interior to the traced
+/// boundary — so abutting, overlapping and crossing inputs all merge by the
+/// same mechanism.
+///
+/// Returning every piece rather than merging blindly is the point: a caller
+/// that requires its inputs to touch can check for exactly one piece, which
+/// makes "are these contiguous?" the same question as "did the union stay
+/// whole?" — no separate adjacency test, no second tolerance to tune.
+///
+/// Holes are not preserved; the result is each piece's silhouette. That
+/// matches the fills, which route one simply-connected region.
+pub fn union_all(polys: &[Polygon]) -> Vec<Polygon> {
+    let mut segments = Vec::new();
+    for poly in polys {
+        let n = poly.points.len();
+        for i in 0..n {
+            segments.push((poly.points[i], poly.points[(i + 1) % n]));
+        }
+    }
+    let mut out: Vec<Polygon> = crate::arrangement::compose(&segments, &mut Vec::new())
+        .into_iter()
+        .map(|piece| Polygon { points: piece.ring })
+        .filter(|p| p.points.len() >= 3)
+        .collect();
+    out.sort_by(|a, b| b.area_mm2().partial_cmp(&a.area_mm2()).unwrap());
+    out
+}
+
 impl Polygon {
     /// Subtract `hole` from this polygon. Returns `None` when nothing is left.
     ///
@@ -126,18 +195,7 @@ impl Polygon {
     /// region necessarily loses the smaller fragments. `pieces` lets the
     /// caller warn about that.
     pub fn subtract(&self, hole: &Polygon) -> Option<Subtraction> {
-        use cavalier_contours::polyline::{BooleanOp, PlineSource, PlineSourceMut, Polyline};
-
-        let to_pline = |poly: &Polygon| {
-            let mut pl = Polyline::new_closed();
-            for p in &poly.points {
-                pl.add(p.x, p.y, 0.0);
-            }
-            if pl.area() < 0.0 {
-                pl.invert_direction_mut();
-            }
-            pl
-        };
+        use cavalier_contours::polyline::{BooleanOp, PlineSource};
 
         let result = to_pline(self).boolean(&to_pline(hole), BooleanOp::Not);
         let pieces = result.pos_plines.len();
@@ -146,23 +204,17 @@ impl Polygon {
             .into_iter()
             .map(|r| r.pline)
             .max_by(|a, b| a.area().abs().partial_cmp(&b.area().abs()).unwrap())?;
-        let points: Vec<Point> = (0..largest.vertex_count())
-            .map(|i| {
-                let v = largest.at(i);
-                Point::new(v.x, v.y)
-            })
-            .collect();
-        if points.len() < 3 {
+        let poly = from_pline(&largest);
+        if poly.points.len() < 3 {
             return None;
         }
         Some(Subtraction {
-            largest: Polygon { points },
+            largest: poly,
             pieces,
         })
     }
 }
 
-/// Distance from `p` to segment `a`–`b`.
 fn point_segment_distance(p: Point, a: Point, b: Point) -> f64 {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let len2 = dx * dx + dy * dy;
@@ -308,6 +360,84 @@ fn finish_ring(current: &mut Vec<Point>, rings: &mut Vec<Vec<Point>>) {
         rings.push(std::mem::take(current));
     } else {
         current.clear();
+    }
+}
+
+#[cfg(test)]
+mod union_tests {
+    use super::*;
+
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Polygon {
+        Polygon {
+            points: vec![
+                Point::new(x0, y0),
+                Point::new(x1, y0),
+                Point::new(x1, y1),
+                Point::new(x0, y1),
+            ],
+        }
+    }
+
+    #[test]
+    fn abutting_rectangles_merge_into_one() {
+        let u = union_all(&[
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(10.0, 0.0, 20.0, 10.0),
+            rect(20.0, 0.0, 30.0, 10.0),
+        ]);
+        assert_eq!(u.len(), 1, "abutting rectangles must merge");
+        assert!(
+            (u[0].area_mm2() - 300.0).abs() < 1e-6,
+            "{}",
+            u[0].area_mm2()
+        );
+    }
+
+    #[test]
+    fn overlapping_rectangles_merge_without_double_counting() {
+        let u = union_all(&[rect(0.0, 0.0, 10.0, 10.0), rect(5.0, 0.0, 15.0, 10.0)]);
+        assert_eq!(u.len(), 1);
+        assert!(
+            (u[0].area_mm2() - 150.0).abs() < 1e-6,
+            "{}",
+            u[0].area_mm2()
+        );
+    }
+
+    /// The whole point: separated inputs stay separated, so "is this selection
+    /// contiguous?" is answered by counting pieces.
+    #[test]
+    fn separated_rectangles_stay_separate() {
+        let u = union_all(&[rect(0.0, 0.0, 10.0, 10.0), rect(50.0, 0.0, 60.0, 10.0)]);
+        assert_eq!(u.len(), 2);
+    }
+
+    /// Order must not matter: a middle piece introduced last still glues the
+    /// two ends together.
+    #[test]
+    fn a_bridging_piece_added_last_still_merges_everything() {
+        let u = union_all(&[
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(20.0, 0.0, 30.0, 10.0),
+            rect(10.0, 0.0, 20.0, 10.0),
+        ]);
+        assert_eq!(u.len(), 1, "the bridge should have joined all three");
+        assert!(
+            (u[0].area_mm2() - 300.0).abs() < 1e-6,
+            "{}",
+            u[0].area_mm2()
+        );
+    }
+
+    #[test]
+    fn an_l_shape_keeps_its_area() {
+        let u = union_all(&[rect(0.0, 0.0, 30.0, 10.0), rect(0.0, 10.0, 10.0, 30.0)]);
+        assert_eq!(u.len(), 1);
+        assert!(
+            (u[0].area_mm2() - 500.0).abs() < 1e-6,
+            "{}",
+            u[0].area_mm2()
+        );
     }
 }
 

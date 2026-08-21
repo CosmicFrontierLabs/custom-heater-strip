@@ -31,9 +31,9 @@ pub struct Reserve {
 }
 
 impl Reserve {
-    /// No reservation at all: the pattern may use the whole polygon. Used by
-    /// multi-region routing, where tab keepouts are cut out of the region
-    /// beforehand rather than reserved during the fill.
+    /// No reservation at all: the pattern may use the whole polygon. Only the
+    /// pattern tests want this; every real design reserves a terminal zone.
+    #[cfg(test)]
     pub fn none() -> Self {
         Reserve {
             lane_edge: f64::NEG_INFINITY,
@@ -74,23 +74,6 @@ impl Reserve {
     }
 }
 
-/// Where a pattern should leave its two path ends relative to each other.
-///
-/// A lone heater wants both ends together, next to the pad pocket. A region
-/// in the middle of a series chain wants them at opposite ends, so the run
-/// coming in and the run going out do not have to cross the fill to reach
-/// their neighbours.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum Terminals {
-    /// Both ends on the same side.
-    #[default]
-    SameSide,
-    /// Ends on opposite sides. Only the plain serpentine can honour this;
-    /// other patterns ignore it, and the caller warns if that costs a
-    /// crossing.
-    OppositeSides,
-}
-
 /// One fill request: which pattern, over what polygon, at what spacing.
 pub struct FillSpec<'a> {
     pub kind: FillKind,
@@ -101,7 +84,86 @@ pub struct FillSpec<'a> {
     pub inset_mm: f64,
     pub reserve: Reserve,
     pub style: CornerStyle,
-    pub terminals: Terminals,
+}
+
+/// How much of a region a scanline pattern can actually reach, in `[0, 1]`.
+///
+/// The scanline fills route one span per row, so a row that crosses the shape
+/// more than once loses everything but its widest section. This measures that
+/// loss before committing to an orientation.
+///
+/// It matters more than it sounds. Sweeping a U across its arms gives two
+/// spans per row and throws away one arm; sweeping it along them gives one
+/// span per row and loses nothing. Same shape, same pattern — the difference
+/// is entirely which way the rows run, which is free to choose.
+pub fn scanline_coverage(outline: &Polygon, pitch_mm: f64, inset_mm: f64, reserve: Reserve) -> f64 {
+    let (min, max) = outline.bbox();
+    let (y_lo, y_hi) = (min.y + inset_mm, max.y - inset_mm);
+    if y_hi <= y_lo || pitch_mm <= 0.0 {
+        return 0.0;
+    }
+    let (mut widest, mut total) = (0.0f64, 0.0f64);
+    let mut y = y_lo;
+    while y <= y_hi {
+        let bound = reserve.left_bound(y);
+        let spans: Vec<f64> = outline
+            .scanline_hits(y)
+            .chunks_exact(2)
+            .map(|c| ((c[0] + inset_mm).max(bound), c[1] - inset_mm))
+            .filter(|(a, b)| b > a)
+            .map(|(a, b)| b - a)
+            .collect();
+        if let Some(best) = spans
+            .iter()
+            .cloned()
+            .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
+        {
+            widest += best;
+            total += spans.iter().sum::<f64>();
+        }
+        y += pitch_mm;
+    }
+    if total <= 0.0 {
+        0.0
+    } else {
+        widest / total
+    }
+}
+
+/// Area of the region the reserve keeps the fill out of, in mm².
+///
+/// The terminal corridor and the tab pocket are real holes in the heated area:
+/// copper never goes there, so that area produces no heat. Measuring it lets
+/// the electrical solve size the trace against what can actually be filled
+/// rather than against the outline, which otherwise asks for a trace too thin
+/// to manufacture and then gets clamped, landing the design off target.
+pub fn reserved_area(outline: &Polygon, pitch_mm: f64, inset_mm: f64, reserve: Reserve) -> f64 {
+    let (min, max) = outline.bbox();
+    let (y_lo, y_hi) = (min.y + inset_mm, max.y - inset_mm);
+    if y_hi <= y_lo || pitch_mm <= 0.0 {
+        return 0.0;
+    }
+    let mut blocked = 0.0;
+    let mut y = y_lo;
+    while y <= y_hi {
+        let bound = reserve.left_bound(y);
+        for c in outline.scanline_hits(y).chunks_exact(2) {
+            let (a, b) = (c[0], c[1]);
+            // How much of this span lies left of the bound.
+            blocked += (bound.min(b) - a).clamp(0.0, b - a);
+        }
+        y += pitch_mm;
+    }
+    blocked * pitch_mm
+}
+
+/// Does this pattern route by horizontal scanlines, and therefore care which
+/// way the rows run?
+pub fn is_scanline(kind: FillKind) -> bool {
+    matches!(
+        kind,
+        FillKind::Serpentine | FillKind::WavySerpentine | FillKind::Counterflow
+    )
 }
 
 /// Route the heater trace with the requested pattern.
@@ -113,21 +175,17 @@ pub fn fill(spec: FillSpec<'_>, warnings: &mut Vec<String>) -> Result<Vec<PathSe
         inset_mm,
         reserve,
         style,
-        terminals,
     } = spec;
     match kind {
-        // Row count parity decides which side the last row ends on: an even
-        // number of rows returns to the starting side, an odd number crosses.
+        // Even row count brings the path's two ends back to the same side,
+        // which is where the terminal corridor is.
         FillKind::Serpentine => serpentine::fill(
             outline,
             pitch_mm,
             inset_mm,
             reserve,
             style,
-            match terminals {
-                Terminals::SameSide => serpentine::RowParity::Even,
-                Terminals::OppositeSides => serpentine::RowParity::Odd,
-            },
+            serpentine::RowParity::Even,
             warnings,
         ),
         FillKind::WavySerpentine => {
