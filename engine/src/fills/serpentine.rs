@@ -213,6 +213,12 @@ pub fn fill(
     Ok(path)
 }
 
+/// How far a wavy row may swing from its row line, as a fraction of the pitch.
+///
+/// Shared with the solver, which has to widen the pitch to pay for it before
+/// the fill ever runs — see `effective_min_gap` in the crate root.
+pub const WAVE_FRACTION: f64 = 0.12;
+
 /// Serpentine with sinusoidal rows. Same topology and turnarounds; each
 /// straight row becomes a sine with an integer number of half-periods
 /// (so it starts and ends exactly on the row line), phase-locked to
@@ -223,6 +229,7 @@ pub fn fill_wavy(
     inset_mm: f64,
     reserve: Reserve,
     style: CornerStyle,
+    min_centre_gap_mm: f64,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathSeg>, EngineError> {
     let base = fill(
@@ -235,29 +242,76 @@ pub fn fill_wavy(
         warnings,
     )?;
 
-    let amplitude = 0.3 * pitch_mm;
-    let target_wavelength = (6.0 * pitch_mm).max(3.0);
-    let min_wavy_len = 2.0 * target_wavelength;
+    // One wavelength and one phase origin for the whole board, not per row.
+    //
+    // This is the part that has to be global. With a per-row wavelength, two
+    // rows of different length drift out of phase, and where they reach
+    // antiphase one crests up while its neighbour troughs down: the
+    // centrelines close from `pitch` to `pitch - 2*amplitude` and the copper
+    // merges. In phase, every row is the same curve shifted by `pitch`, so the
+    // vertical separation is exactly `pitch` everywhere.
+    let (min, max) = outline.bbox();
+    let wavelength = (6.0 * pitch_mm).max(3.0);
+    let k = std::f64::consts::TAU / wavelength;
+
+    // The amplitude the pitch can actually pay for.
+    //
+    // Two neighbouring rows leaning toward each other close the gap by twice
+    // the amplitude, so whatever the pitch has spare over the required
+    // centreline clearance has to cover both of them: `A <= (pitch - need)/2`.
+    // That bound holds however the rows line up, which matters because they do
+    // not line up perfectly — the taper at the row ends is keyed to each row's
+    // own length, so two rows of different length are not quite parallel
+    // curves near their turnarounds.
+    //
+    // The cosine term is the second bound. Even perfectly parallel sinusoids
+    // offset by `pitch` are closer than `pitch` by the cosine of their slope,
+    // so `A <= sqrt(1/r^2 - 1)/k` where `r = need/pitch`. Take whichever bound
+    // binds, and cap at `WAVE_FRACTION` of the pitch for looks.
+    let slack = ((pitch_mm - min_centre_gap_mm) / 2.0).max(0.0);
+    let ratio = if pitch_mm > 0.0 {
+        min_centre_gap_mm / pitch_mm
+    } else {
+        1.0
+    };
+    let parallel = if ratio >= 1.0 {
+        0.0
+    } else {
+        ((1.0 / (ratio * ratio)) - 1.0).sqrt() / k
+    };
+    let amplitude = slack.min(parallel).min(WAVE_FRACTION * pitch_mm);
+
+    if amplitude < 0.02 * pitch_mm {
+        warnings.push(
+            "no room to make the rows wavy: at this pitch a sinusoid would \
+             bring neighbouring traces closer than the fab gap, so the rows \
+             are left straight. Widen the gap or lower the target power for a \
+             wavy fill."
+                .into(),
+        );
+        return Ok(base);
+    }
 
     let mut out = Vec::with_capacity(base.len() * 8);
     for seg in base {
         match seg {
-            PathSeg::Line { a, b } if (a.y - b.y).abs() < 1e-9 && a.dist(&b) >= min_wavy_len => {
+            PathSeg::Line { a, b }
+                if (a.y - b.y).abs() < 1e-9 && a.dist(&b) >= 2.0 * wavelength =>
+            {
                 let len = a.dist(&b);
-                let half_periods = (2.0 * len / target_wavelength).round().max(2.0);
-                let x_left = a.x.min(b.x);
-                let samples = (half_periods as usize) * 8;
+                let samples = ((len / wavelength) * 16.0).ceil().max(8.0) as usize;
                 let mut prev = a;
                 for i in 1..=samples {
                     let t = i as f64 / samples as f64;
                     let x = a.x + (b.x - a.x) * t;
-                    let y = if i == samples {
-                        b.y // exact landing on the row line
-                    } else {
-                        a.y + amplitude
-                            * (half_periods * std::f64::consts::PI * (x - x_left) / len).sin()
-                    };
-                    let p = Point::new(x, y);
+                    // Fade the wave out near both ends of the row so it meets
+                    // the turnaround smoothly. A step back to the row line
+                    // would be a near-vertical jog, and a jog is exactly where
+                    // the clearance to the next row would be lost.
+                    let from_end = (x - a.x.min(b.x)).min(a.x.max(b.x) - x);
+                    let taper = (from_end / wavelength).clamp(0.0, 1.0);
+                    let y = a.y + amplitude * taper * (k * (x - min.x)).sin();
+                    let p = Point::new(x, if i == samples { b.y } else { y });
                     out.push(PathSeg::Line { a: prev, b: p });
                     prev = p;
                 }
@@ -265,13 +319,10 @@ pub fn fill_wavy(
             other => out.push(other),
         }
     }
+    let _ = max;
     Ok(out)
 }
 
-/// Counterflow (bifilar) serpentine: a serpentine at pitch 2p is offset
-/// ±p/2 into two parallel runs joined by a cap at the far end. Current
-/// counterflows everywhere (non-inductive) and both terminals sit adjacent
-/// at the start, one pitch apart.
 pub fn fill_counterflow(
     outline: &Polygon,
     pitch_mm: f64,
@@ -450,13 +501,15 @@ mod tests {
             0.6,
             Reserve::none(),
             CornerStyle::Rectangular,
+            0.7,
             &mut Vec::new(),
         )
         .unwrap();
-        assert_path_well_formed(&s, 0.6, 0.6 - 0.31, 100.0 - 0.6, 20.0 - 0.6 + 0.31);
+        let amp = WAVE_FRACTION * 1.0;
+        assert_path_well_formed(&s, 0.6, 0.6 - amp, 100.0 - 0.6, 20.0 - 0.6 + amp);
         // Some segment must deviate from its row line (the wave exists).
         let wavy = s.iter().any(|seg| {
-            matches!(seg, PathSeg::Line { a, b } if (a.y - b.y).abs() > 0.05 && (a.x - b.x).abs() > 1e-9)
+            matches!(seg, PathSeg::Line { a, b } if (a.y - b.y).abs() > 0.02 && (a.x - b.x).abs() > 1e-9)
         });
         assert!(wavy, "no undulation found");
         // Far more segments than the plain serpentine's ~2 per row.

@@ -192,6 +192,8 @@ pub struct RouteSpec<'a> {
     pub pitch_mm: f64,
     pub inset_mm: f64,
     pub style: CornerStyle,
+    /// Centreline separation the fab requires: width + minimum gap.
+    pub min_centre_gap_mm: f64,
     pub tab_in: &'a Pad,
     pub tab_out: &'a Pad,
 }
@@ -204,6 +206,7 @@ pub fn route(spec: RouteSpec<'_>, warnings: &mut Vec<String>) -> Result<Routed, 
         pitch_mm,
         inset_mm,
         style,
+        min_centre_gap_mm,
         tab_in,
         tab_out,
     } = spec;
@@ -233,6 +236,7 @@ pub fn route(spec: RouteSpec<'_>, warnings: &mut Vec<String>) -> Result<Routed, 
             inset_mm,
             reserve: corridor.reserve,
             style,
+            min_centre_gap_mm,
         },
         warnings,
     )?;
