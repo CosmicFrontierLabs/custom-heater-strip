@@ -199,6 +199,29 @@ fn zip_gerbers(
     Ok(base64::engine::general_purpose::STANDARD.encode(buf))
 }
 
+/// The gap to solve against, padded for a pattern that wanders.
+///
+/// A straight fill sets `pitch = width + min_gap`, which leaves neighbouring
+/// rows exactly as close as the process allows — no room at all for a row to
+/// move. Any pattern that makes a row wander therefore has to buy its own
+/// room, and the honest price is the full excursion on both sides: two rows
+/// leaning toward each other close the gap by twice the amplitude, so the
+/// pitch has to carry `2A` on top of the clearance.
+///
+/// Solving for the pitch that leaves an amplitude of [`WAVE_FRACTION`] of
+/// itself gives `pitch = need / (1 - 2f)`, and the extra gap to ask the solver
+/// for is the difference. It costs rows, which the refinement step absorbs
+/// into the trace width. Asking up front is the difference between a wavy fill
+/// and a wavy fill that quietly comes out straight.
+fn effective_min_gap(req: &DesignRequest, rough: &solver::Solved) -> f64 {
+    if req.fill_kind == shared::FillKind::WavySerpentine {
+        let f = fills::serpentine::WAVE_FRACTION;
+        req.min_gap_mm + rough.pitch_mm * 2.0 * f / (1.0 - 2.0 * f)
+    } else {
+        req.min_gap_mm
+    }
+}
+
 /// Solve the electrical + geometric design without generating output files.
 ///
 /// Two input paths: an SVG outline routed as a single region with
@@ -224,7 +247,19 @@ fn design_from_svg(req: &DesignRequest) -> Result<Design, EngineError> {
         )));
     }
 
-    let solved = solver::solve(req, area_mm2)?;
+    let rough = solver::solve(req, area_mm2)?;
+    let gap = effective_min_gap(req, &rough);
+    let solved = if gap > req.min_gap_mm {
+        solver::solve(
+            &DesignRequest {
+                min_gap_mm: gap,
+                ..req.clone()
+            },
+            area_mm2,
+        )?
+    } else {
+        rough
+    };
     let inset = req.edge_margin_mm + solved.width_mm / 2.0;
 
     let plan = terminals::layout(
@@ -244,6 +279,7 @@ fn design_from_svg(req: &DesignRequest) -> Result<Design, EngineError> {
             inset_mm: inset,
             reserve: plan.reserve,
             style: req.corner_style,
+            min_centre_gap_mm: solved.width_mm + req.min_gap_mm,
         },
         &mut warnings,
     )?;
@@ -285,6 +321,7 @@ fn design_from_svg(req: &DesignRequest) -> Result<Design, EngineError> {
         req.edge_margin_mm,
         &mut warnings,
     )?;
+    check_clearance(&trace, refined.width_mm, req.min_gap_mm, &mut warnings)?;
 
     let mut report = DesignReport {
         target_resistance_ohms: refined.target_resistance_ohms,
@@ -382,7 +419,12 @@ fn design_from_geometry(req: &DesignRequest, spec: &GeometrySpec) -> Result<Desi
     // small board can fall under the fab minimum. That is worth reporting, but
     // not worth refusing a design over — the rough sizing still produces a
     // usable board, it just runs under target. So fall back and say so.
-    let (solved, effective) = match solver::solve(req, fillable) {
+    let wavy_gap = effective_min_gap(req, &rough);
+    let solve_req = DesignRequest {
+        min_gap_mm: wavy_gap,
+        ..req.clone()
+    };
+    let (solved, effective) = match solver::solve(&solve_req, fillable) {
         Ok(s) => {
             if reserved > 0.0 {
                 warnings.push(format!(
@@ -423,6 +465,7 @@ fn design_from_geometry(req: &DesignRequest, spec: &GeometrySpec) -> Result<Desi
             pitch_mm: solved.pitch_mm,
             inset_mm: inset,
             style: req.corner_style,
+            min_centre_gap_mm: solved.width_mm + req.min_gap_mm,
             tab_in: &tab_in,
             tab_out: &tab_out,
         },
@@ -465,6 +508,7 @@ fn design_from_geometry(req: &DesignRequest, spec: &GeometrySpec) -> Result<Desi
         req.edge_margin_mm,
         &mut warnings,
     )?;
+    check_clearance(&trace, refined.width_mm, req.min_gap_mm, &mut warnings)?;
 
     if link_length_mm > 0.25 * length_mm {
         warnings.push(format!(
@@ -564,7 +608,58 @@ fn check_on_board(
     Ok(())
 }
 
-/// Axis-aligned box around a set of polygons, grown by `margin_mm`.
+/// Check the trace against its own copper.
+///
+/// Separate from [`check_on_board`] and from the self-intersection check,
+/// because it asks a different question and catches a different bug. A trace
+/// is `width` wide, so two centrelines must stay `width + min_gap` apart for
+/// their *edges* to clear. Straight rows at a pitch of width-plus-gap satisfy
+/// that by construction, which is exactly why checking only for crossings
+/// looked sufficient — but any pattern that makes a row wander can close the
+/// gap without either centreline ever crossing the other.
+///
+/// Graded the same way as the board-edge check, and for the same reason. A
+/// negative edge gap means the two conductors physically overlap: the plot is
+/// one piece of copper where the design says two, the resistance is not what
+/// was solved for, and no fab tolerance makes that acceptable — that is a hard
+/// refusal. A positive gap under the process minimum is a yield question, not
+/// a wrong design, so it warns and lets the caller decide.
+fn check_clearance(
+    trace: &[PathSeg],
+    width_mm: f64,
+    min_gap_mm: f64,
+    warnings: &mut Vec<String>,
+) -> Result<(), EngineError> {
+    let faults = geom::find_too_close(trace, width_mm, min_gap_mm);
+    let Some(worst) = faults.first() else {
+        return Ok(());
+    };
+    if worst.edge_gap_mm < 0.0 {
+        return Err(EngineError::Infeasible(format!(
+            "the trace overlaps itself at ({:.2}, {:.2}) mm, where two \
+             centrelines pass {:.3} mm apart but the copper is {width_mm:.3} mm \
+             wide — the two runs merge into one, at {} place(s). Try a \
+             different fill pattern, a wider gap, or less power.",
+            worst.at.x,
+            worst.at.y,
+            worst.centre_gap_mm,
+            faults.len()
+        )));
+    }
+    warnings.push(format!(
+        "copper comes within {:.3} mm of itself at ({:.2}, {:.2}) mm, under the \
+         {min_gap_mm:.3} mm process minimum, at {} place(s). The traces do not \
+         touch, so the design is routable, but expect etch-tolerance risk \
+         there.",
+        worst.edge_gap_mm,
+        worst.at.x,
+        worst.at.y,
+        faults.len()
+    ));
+    Ok(())
+}
+
+/// Axis-aligned box around a set of polygons/// Axis-aligned box around a set of polygons, grown by `margin_mm`.
 fn bounding_outline<'a>(polys: impl Iterator<Item = &'a Polygon>, margin_mm: f64) -> Polygon {
     let mut min = Point::new(f64::INFINITY, f64::INFINITY);
     let mut max = Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -825,6 +920,13 @@ mod tests {
     #[test]
     fn every_fill_kind_routes_the_merged_region() {
         for kind in shared::FillKind::ALL {
+            // Concentric rings do not survive a concave outline: successive
+            // offsets of a reflex corner collide with each other and the
+            // copper merges. Tracked as #26; asserted directly by
+            // `concentric_is_refused_on_a_concave_outline`.
+            if kind == shared::FillKind::Concentric {
+                continue;
+            }
             let req = DesignRequest {
                 fill_kind: kind,
                 ..merged_request(2)
@@ -1071,25 +1173,48 @@ mod tests {
         }
     }
 
-    /// The outline-following patterns handle the same shape correctly, which is
-    /// what the rejection message tells the user to reach for.
+    /// Concentric rings cannot hold their spacing around a reflex corner: each
+    /// offset shortens the inside of the turn until neighbouring rings run into
+    /// each other, and the plot comes out as one merged pour rather than a
+    /// spiral. The clearance check catches it, and this pins the refusal so the
+    /// test flips loudly when #26 is fixed rather than quietly staying broken.
     #[test]
-    fn outline_following_patterns_route_the_letter_s_cleanly() {
-        for kind in [shared::FillKind::Concentric, shared::FillKind::DoubleSpiral] {
-            let d = design(&DesignRequest {
-                svg: letter_s_svg(),
-                watts: 12.0,
-                edge_margin_mm: 0.6,
-                fill_kind: kind,
-                ..rect_request()
-            })
-            .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
-            assert!(
-                geom::find_escapes(&d.trace, &d.outline, d.trace_width_mm, 0.0).is_empty(),
-                "{kind:?} put copper off the board"
-            );
-            assert!(trace_shorts(&d).is_empty(), "{kind:?} shorts");
+    fn concentric_is_refused_on_a_concave_outline() {
+        let req = DesignRequest {
+            svg: letter_s_svg(),
+            watts: 12.0,
+            edge_margin_mm: 0.6,
+            fill_kind: shared::FillKind::Concentric,
+            ..rect_request()
+        };
+        match design(&req) {
+            Err(EngineError::Infeasible(msg)) => {
+                assert!(msg.contains("overlaps itself"), "{msg}");
+            }
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("merged copper was accepted"),
         }
+    }
+
+    /// The pattern the rejection message tells the user to reach for does work
+    /// on the same shape: unlike concentric rings, a spiral has somewhere to go
+    /// when the offsets crowd a reflex corner.
+    #[test]
+    fn the_double_spiral_routes_the_letter_s_cleanly() {
+        let kind = shared::FillKind::DoubleSpiral;
+        let d = design(&DesignRequest {
+            svg: letter_s_svg(),
+            watts: 12.0,
+            edge_margin_mm: 0.6,
+            fill_kind: kind,
+            ..rect_request()
+        })
+        .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        assert!(
+            geom::find_escapes(&d.trace, &d.outline, d.trace_width_mm, 0.0).is_empty(),
+            "{kind:?} put copper off the board"
+        );
+        assert!(trace_shorts(&d).is_empty(), "{kind:?} shorts");
     }
 
     #[test]

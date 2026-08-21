@@ -84,6 +84,10 @@ pub struct FillSpec<'a> {
     pub inset_mm: f64,
     pub reserve: Reserve,
     pub style: CornerStyle,
+    /// How far apart two centrelines must stay for their edges to clear:
+    /// trace width plus the fab's minimum gap. Patterns that make a row
+    /// wander need it to know how much room they have to play with.
+    pub min_centre_gap_mm: f64,
 }
 
 /// How much of a region a scanline pattern can actually reach, in `[0, 1]`.
@@ -176,6 +180,7 @@ pub fn fill(spec: FillSpec<'_>, warnings: &mut Vec<String>) -> Result<Vec<PathSe
         inset_mm,
         reserve,
         style,
+        min_centre_gap_mm,
     } = spec;
     match kind {
         // Even row count brings the path's two ends back to the same side,
@@ -189,9 +194,15 @@ pub fn fill(spec: FillSpec<'_>, warnings: &mut Vec<String>) -> Result<Vec<PathSe
             serpentine::RowParity::Even,
             warnings,
         ),
-        FillKind::WavySerpentine => {
-            serpentine::fill_wavy(outline, pitch_mm, inset_mm, reserve, style, warnings)
-        }
+        FillKind::WavySerpentine => serpentine::fill_wavy(
+            outline,
+            pitch_mm,
+            inset_mm,
+            reserve,
+            style,
+            min_centre_gap_mm,
+            warnings,
+        ),
         FillKind::Counterflow => {
             serpentine::fill_counterflow(outline, pitch_mm, inset_mm, reserve, style, warnings)
         }
