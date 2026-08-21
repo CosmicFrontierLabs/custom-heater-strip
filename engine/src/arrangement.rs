@@ -73,7 +73,8 @@ pub fn compose(segments: &[(Point, Point)], warnings: &mut Vec<String>) -> Vec<P
     }
     if untraceable > 0 {
         warnings.push(format!(
-            "{untraceable} group(s) of line work could not be closed into an              outline and were skipped"
+            "{untraceable} group(s) of line work could not be closed into an \
+             outline and were skipped"
         ));
     }
     pieces
