@@ -269,20 +269,88 @@ fn sample(seg: &PathSeg, t: f64) -> Point {
     }
 }
 
+/// Axis-aligned bounds of a segment, arcs measured over their true sweep.
+fn bounds(seg: &PathSeg) -> (f64, f64, f64, f64) {
+    let mut lo = (f64::INFINITY, f64::INFINITY);
+    let mut hi = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    // An arc can bulge past both endpoints, so sample it rather than taking
+    // the chord's box — a box that is too small silently loses real shorts.
+    let n = if matches!(seg, PathSeg::Arc { .. }) {
+        SAMPLES_PER_SEG
+    } else {
+        1
+    };
+    for k in 0..=n {
+        let p = sample(seg, k as f64 / n as f64);
+        lo = (lo.0.min(p.x), lo.1.min(p.y));
+        hi = (hi.0.max(p.x), hi.1.max(p.y));
+    }
+    (lo.0, lo.1, hi.0, hi.1)
+}
+
 /// Every pair of segments in `trace` that shorts against another, ignoring
 /// pairs that merely share an endpoint. Returns index pairs, `i < j`.
 ///
-/// `O(n²)`, so callers with long traces should restrict `probe` to the
-/// segments they actually care about.
+/// A uniform grid keeps this near-linear. The naive form is `O(n²)`, and a
+/// heater is the worst possible input for that: the wavy serpentine emits over
+/// twenty thousand segments on one board, which is more than four hundred
+/// million pair tests — slow enough to look like a hang. Since a trace is a
+/// long thin thing packed at uniform pitch, bucketing by bounding box leaves
+/// each segment with a handful of candidates instead of all of them.
 pub fn find_shorts(trace: &[PathSeg], probe: &[usize]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    for &i in probe {
-        for (j, other) in trace.iter().enumerate() {
-            if j == i {
-                continue;
+    if trace.is_empty() || probe.is_empty() {
+        return Vec::new();
+    }
+    let boxes: Vec<(f64, f64, f64, f64)> = trace.iter().map(bounds).collect();
+
+    // Cell size from the mean segment extent: big enough that a segment spans
+    // few cells, small enough that a cell holds few segments.
+    let mean = boxes
+        .iter()
+        .map(|b| (b.2 - b.0).max(b.3 - b.1))
+        .sum::<f64>()
+        / boxes.len() as f64;
+    let cell = mean.max(1e-6);
+    let key = |x: f64, y: f64| ((x / cell).floor() as i64, (y / cell).floor() as i64);
+
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, b) in boxes.iter().enumerate() {
+        let (lo, hi) = (key(b.0, b.1), key(b.2, b.3));
+        for gx in lo.0..=hi.0 {
+            for gy in lo.1..=hi.1 {
+                grid.entry((gx, gy)).or_default().push(i);
             }
-            if shorts(&trace[i], other) {
-                out.push((i.min(j), i.max(j)));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for &i in probe {
+        let b = boxes[i];
+        let (lo, hi) = (key(b.0, b.1), key(b.2, b.3));
+        for gx in lo.0..=hi.0 {
+            for gy in lo.1..=hi.1 {
+                let Some(bucket) = grid.get(&(gx, gy)) else {
+                    continue;
+                };
+                for &j in bucket {
+                    if j == i {
+                        continue;
+                    }
+                    let pair = (i.min(j), i.max(j));
+                    if !seen.insert(pair) {
+                        continue;
+                    }
+                    // Cheap box rejection before the exact test.
+                    let c = boxes[j];
+                    if b.2 < c.0 - EPS || c.2 < b.0 - EPS || b.3 < c.1 - EPS || c.3 < b.1 - EPS {
+                        continue;
+                    }
+                    if shorts(&trace[i], &trace[j]) {
+                        out.push(pair);
+                    }
+                }
             }
         }
     }
@@ -447,6 +515,50 @@ mod tests {
             ccw: true,
         };
         assert!(!shorts(&upper, &lower));
+    }
+
+    /// The grid must be an optimisation, not a filter. A broad phase that
+    /// drops a real short is worse than a slow one, so it is checked against
+    /// the exhaustive answer on a trace with plenty of near-misses.
+    #[test]
+    fn the_grid_agrees_with_exhaustive_search() {
+        // A serpentine-like comb plus a bar crossing every tooth.
+        let mut trace = Vec::new();
+        for i in 0..40 {
+            let y = i as f64 * 0.5;
+            trace.push(line(0.0, y, 20.0, y));
+            trace.push(line(20.0, y, 20.0, y + 0.5));
+        }
+        trace.push(line(10.0, -1.0, 10.0, 21.0));
+        // Plus an arc that bulges across several teeth.
+        trace.push(PathSeg::Arc {
+            a: Point::new(4.0, 4.0),
+            b: Point::new(4.0, 9.0),
+            center: Point::new(4.0, 6.5),
+            ccw: true,
+        });
+
+        let all: Vec<usize> = (0..trace.len()).collect();
+        let fast = find_shorts(&trace, &all);
+
+        let mut naive = Vec::new();
+        for i in 0..trace.len() {
+            for j in (i + 1)..trace.len() {
+                if shorts(&trace[i], &trace[j]) {
+                    naive.push((i, j));
+                }
+            }
+        }
+        naive.sort_unstable();
+
+        assert!(!naive.is_empty(), "fixture should contain real shorts");
+        assert_eq!(
+            fast,
+            naive,
+            "grid found {} shorts, exhaustive found {}",
+            fast.len(),
+            naive.len()
+        );
     }
 
     #[test]

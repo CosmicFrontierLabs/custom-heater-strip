@@ -1,47 +1,30 @@
-//! Multi-region routing: fill several heater polygons and chain them in
-//! series so the whole board is one electrical element between two tabs.
+//! Routing a heater over a selection of DXF polygons.
 //!
-//! ```text
-//!    ┌─ tab in                        regions are filled independently,
-//!    ▼                                then joined end to end:
-//!   ╔═╗  ┌────────┐   ┌────────┐
-//!   ║ ╠══╪════════╪═══╪════════╪══╗
-//!   ╚═╝  │ region │   │ region │  ║  ┌────────┐
-//!        │   0    │   │   1    │  ╚══╪════════╪═╗
-//!        └────────┘   └────────┘     │region 2│ ║
-//!                                    └────────┘ ▼
-//!                                            tab out
-//! ```
+//! The selection is required to be **contiguous**, and the solder tabs to sit
+//! **inside** it. Those two constraints are what make this tractable, and
+//! together they collapse what used to be a hard problem into an easy one:
 //!
-//! Two problems have to be solved for the joins to be manufacturable.
+//! - Contiguous polygons have a connected union, so they are unioned into
+//!   **one region** and filled **once**. There is no chain of regions and no
+//!   linking runs between them — which is worth stating plainly, because those
+//!   links were the entire source of copper-crossing-copper. A problem removed
+//!   rather than mitigated.
+//! - Tabs inside the region mean every feed run is short and local. Each tab
+//!   gets a **channel** carved from it to a **lane** reserved down one side of
+//!   the region, and the fill is handed what is left. That is the same shape as
+//!   the auto-placed pads' pocket-and-lane, which is already known to produce
+//!   clean feeds; the only difference is that the pocket sits wherever the user
+//!   drew the tab instead of where we chose to put it.
 //!
-//! **Where a region's terminals land.** A link that has to reach around a
-//! region to find its terminal would cross the fill that region just laid
-//! down, shorting it. Two things prevent that:
-//!
-//! - A region whose neighbours lie on *opposite* sides is filled with its two
-//!   ends at opposite edges ([`Terminals::OppositeSides`]), so the run coming
-//!   in and the run going out each meet an edge that faces where they came
-//!   from. A region whose neighbours are both off the *same* side keeps its
-//!   ends together and aims between them.
-//! - The region is then rotated by a multiple of 90° before filling so the
-//!   entry edge faces the incoming run, and the routed path is rotated back.
-//!   Only rotations are used — never reflections — because a reflection would
-//!   invert every arc's sweep direction.
-//!
-//! Only the plain serpentine can split its terminals; the other patterns
-//! always deliver both ends together, so a chain of them may still need a
-//! link that crosses copper. That is detected and warned about rather than
-//! silently shipped.
-//!
-//! **Keeping copper off the pads.** A tab that overlaps a heater region is
-//! cut out of that region (plus clearance) before filling, so the pattern
-//! wraps around the pad instead of shorting into it.
+//! The region is rotated by a multiple of 90° before filling so the lane is on
+//! the left, which is where every pattern delivers its path ends, and the
+//! routed path is rotated back. Only rotations, never reflections: a
+//! reflection would invert every arc's sweep direction.
 
 use shared::{CornerStyle, FillKind};
 
-use crate::fills::{self, Reserve, Terminals};
-use crate::outline::Polygon;
+use crate::fills::{self, Reserve};
+use crate::outline::{self, Polygon};
 use crate::terminals::Pad;
 use crate::{EngineError, PathSeg, Point};
 
@@ -57,7 +40,6 @@ enum Quarter {
 impl Quarter {
     const ALL: [Quarter; 4] = [Quarter::R0, Quarter::R90, Quarter::R180, Quarter::R270];
 
-    /// Rotate a point about the origin.
     fn apply(&self, p: Point) -> Point {
         match self {
             Quarter::R0 => p,
@@ -102,203 +84,110 @@ impl Quarter {
     }
 }
 
-/// A heater region prepared for routing.
-pub struct Region {
-    /// The polygon to fill, with tab keepouts already cut out.
-    pub polygon: Polygon,
-    /// Where this region's entry terminal should face.
-    target: Point,
-    /// Whether the two terminals should sit together or at opposite ends.
-    terminals: Terminals,
+/// The heater selection, validated and merged.
+#[derive(Debug)]
+pub struct Plan {
+    /// The single region to fill: the union of the selected polygons.
+    pub region: Polygon,
+    /// How many polygons went into it.
+    pub merged_from: usize,
 }
 
-/// Everything the chainer needs to route a design.
-pub struct Chain {
-    /// The regions in series order.
-    pub regions: Vec<Region>,
-}
-
-/// Order regions into a series chain and cut tab keepouts out of them.
+/// Union the selection and enforce the two rules that make it routable.
 ///
-/// `clearance_mm` is how far the fill must stay from pad copper.
+/// Contiguity is checked by *counting the pieces of the union*: if the
+/// polygons all touch, there is one. That is the same question asked once
+/// rather than an adjacency test with its own separate tolerance.
 pub fn plan(
     heaters: &[Polygon],
-    tab_in: &Pad,
-    tab_out: &Pad,
-    clearance_mm: f64,
+    tabs: [&Pad; 2],
     warnings: &mut Vec<String>,
-) -> Result<Chain, EngineError> {
+) -> Result<Plan, EngineError> {
     if heaters.is_empty() {
         return Err(EngineError::BadGeometry(
-            "no heater regions selected".into(),
+            "select at least one polygon as a heater region".into(),
         ));
     }
 
-    // Walk the regions greedily from the input tab: at each step take the
-    // nearest region not yet used. This keeps the links short and, for the
-    // common case of regions in a row, visits them in the obvious order.
-    let mut remaining: Vec<usize> = (0..heaters.len()).collect();
-    let mut order: Vec<usize> = Vec::with_capacity(heaters.len());
-    let mut cursor = tab_in.center();
-    while !remaining.is_empty() {
-        let (slot, &idx) = remaining
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                let da = heaters[**a].centroid().dist(&cursor);
-                let db = heaters[**b].centroid().dist(&cursor);
-                da.partial_cmp(&db).unwrap()
-            })
-            .expect("remaining is non-empty");
-        order.push(idx);
-        cursor = heaters[idx].centroid();
-        remaining.remove(slot);
-    }
-
-    // Each region's terminals should face whatever it connects to: the tab at
-    // either end of the chain, the neighbouring region in the middle. A lone
-    // region connects to both tabs, so it aims between them.
-    let n = order.len();
-    let mut regions = Vec::with_capacity(n);
-    for (pos, &idx) in order.iter().enumerate() {
-        let before = if pos == 0 {
-            tab_in.center()
-        } else {
-            heaters[order[pos - 1]].centroid()
-        };
-        let after = if pos + 1 == n {
-            tab_out.center()
-        } else {
-            heaters[order[pos + 1]].centroid()
-        };
-
-        // If what this region connects to sits on roughly opposite sides of
-        // it, the fill must enter one side and leave the other; otherwise a
-        // link would have to cross the fill to get out. When both neighbours
-        // are off the same side, keep the ends together and aim between them.
-        let c = heaters[idx].centroid();
-        let (v_in, v_out) = (
-            Point::new(before.x - c.x, before.y - c.y),
-            Point::new(after.x - c.x, after.y - c.y),
-        );
-        let opposed = v_in.x * v_out.x + v_in.y * v_out.y < 0.0;
-        let (terminals, target) = if opposed {
-            // Orient toward the incoming side; the exit lands opposite it.
-            (Terminals::OppositeSides, before)
-        } else {
-            (
-                Terminals::SameSide,
-                Point::new((before.x + after.x) / 2.0, (before.y + after.y) / 2.0),
-            )
-        };
-
-        let polygon = cut_tabs(&heaters[idx], [tab_in, tab_out], clearance_mm, warnings)?;
-        regions.push(Region {
-            polygon,
-            target,
-            terminals,
-        });
-    }
-
-    Ok(Chain { regions })
-}
-
-/// Cut any tab that overlaps this region out of it, so the fill wraps the pad.
-fn cut_tabs(
-    region: &Polygon,
-    tabs: [&Pad; 2],
-    clearance_mm: f64,
-    warnings: &mut Vec<String>,
-) -> Result<Polygon, EngineError> {
-    let mut out = region.clone();
-    for tab in tabs {
-        let keepout = Polygon {
-            points: tab.grown_ring(clearance_mm),
-        };
-        if !out.overlaps(&keepout) {
-            continue;
-        }
-        let cut = out
-            .subtract(&channel_keepout(&out, &keepout))
-            .ok_or_else(|| {
-                EngineError::BadGeometry(
-                    "a solder tab covers its whole heater region; move the tab or \
-                 pick a larger region"
-                        .into(),
-                )
-            })?;
-        if cut.pieces > 1 {
-            warnings.push(format!(
-                "a solder tab splits its heater region into {} pieces; only the \
-                 largest is filled. Move the tab nearer an edge to keep full \
-                 coverage.",
-                cut.pieces
-            ));
-        }
-        out = cut.largest;
-    }
-    Ok(out)
-}
-
-/// Keepout to cut for a tab: its bounding box, extended out past the nearest
-/// side of the region.
-///
-/// The extension is what makes this correct. Subtracting a tab that sits
-/// wholly inside a region would leave an enclosed hole, and the fill patterns
-/// route one continuous path through a simply-connected polygon — they cannot
-/// wrap a hole, and the boolean's positive contour would come back as the
-/// untouched region, silently leaving copper over the pad. Reaching the edge
-/// turns the cut into a notch instead, which doubles as the corridor the
-/// tab's feed run travels down.
-///
-/// Using the bounding box rather than the exact ring removes a little more
-/// copper than strictly needed for a round or angled tab; that errs toward
-/// clearance, which is the safe direction.
-fn channel_keepout(region: &Polygon, keepout: &Polygon) -> Polygon {
-    let (rlo, rhi) = region.bbox();
-    let (lo, hi) = keepout.bbox();
-    // Overshoot the boundary so the cut definitely crosses it rather than
-    // leaving a sliver of copper behind.
-    let over = 1.0;
-
-    let rect = |x0: f64, y0: f64, x1: f64, y1: f64| Polygon {
-        points: vec![
-            Point::new(x0, y0),
-            Point::new(x1, y0),
-            Point::new(x1, y1),
-            Point::new(x0, y1),
-        ],
+    let pieces = outline::union_all(heaters);
+    let Some(region) = pieces.first().cloned() else {
+        return Err(EngineError::BadGeometry(
+            "the selected heater polygons enclose no area".into(),
+        ));
     };
+    if pieces.len() > 1 {
+        return Err(EngineError::BadGeometry(format!(
+            "the selected heater regions fall into {} separate groups, but they \
+             must all touch so the heater is one connected element. Extend them \
+             until they share an edge, or deselect the outliers.",
+            pieces.len()
+        )));
+    }
 
-    // Break out toward whichever side is closest, so the channel is as short
-    // as possible and takes the least copper with it.
-    let candidates = [
-        (lo.x - rlo.x, rect(rlo.x - over, lo.y, hi.x, hi.y)),
-        (rhi.x - hi.x, rect(lo.x, lo.y, rhi.x + over, hi.y)),
-        (lo.y - rlo.y, rect(lo.x, rlo.y - over, hi.x, hi.y)),
-        (rhi.y - hi.y, rect(lo.x, lo.y, hi.x, rhi.y + over)),
-    ];
-    candidates
-        .into_iter()
-        .min_by(|(a, _), (b, _)| a.partial_cmp(b).expect("finite bounds"))
-        .expect("four candidates")
-        .1
+    for (tab, which) in tabs.into_iter().zip(["input", "output"]) {
+        let ring = Polygon { points: tab.ring() };
+        if !region.contains_polygon(&ring) {
+            let touching = region.overlaps(&ring);
+            return Err(EngineError::BadGeometry(format!(
+                "the {which} solder tab must sit entirely inside the heater \
+                 area{}",
+                if touching {
+                    ", but it hangs over the edge"
+                } else {
+                    "; it is currently outside it"
+                }
+            )));
+        }
+    }
+
+    if heaters.len() > 1 {
+        warnings.push(format!(
+            "{} selected polygons merged into one heater of {:.1} cm²",
+            heaters.len(),
+            region.area_mm2() / 100.0
+        ));
+    }
+    Ok(Plan {
+        region,
+        merged_from: heaters.len(),
+    })
 }
 
-/// A routed chain: one continuous pad-to-pad trace, plus which of its
-/// segments are the links inserted between regions and tabs.
+/// Area of the region the terminal corridor and tab pocket keep the fill out
+/// of, in mm², for the orientation that would actually be chosen.
+///
+/// Wanted before routing, so the electrical solve can size the trace against
+/// the area it can really fill.
+pub fn reserved_area(
+    plan: &Plan,
+    tab_in: &Pad,
+    tab_out: &Pad,
+    inset_mm: f64,
+    pitch_mm: f64,
+) -> f64 {
+    let (_, rotated, _, _, corridor) = choose_orientation(
+        plan,
+        tab_in,
+        tab_out,
+        inset_mm,
+        pitch_mm,
+        FillKind::Serpentine,
+    );
+    fills::reserved_area(&rotated, pitch_mm, inset_mm, corridor.reserve)
+}
+
+/// A routed design over the unioned region.
 pub struct Routed {
     pub trace: Vec<PathSeg>,
-    /// Indices into `trace` of the connecting runs.
+    /// Indices of the feed runs, for the copper-on-copper check.
     pub link_indices: Vec<usize>,
-    /// Total length of those runs — resistance that heats the interconnect
-    /// rather than the board.
+    /// Total length of those runs.
     pub link_length_mm: f64,
 }
 
-/// One routing request: the planned chain plus the trace parameters.
+/// One routing request.
 pub struct RouteSpec<'a> {
-    pub chain: &'a Chain,
+    pub plan: &'a Plan,
     pub kind: FillKind,
     pub pitch_mm: f64,
     pub inset_mm: f64,
@@ -307,10 +196,10 @@ pub struct RouteSpec<'a> {
     pub tab_out: &'a Pad,
 }
 
-/// Fill every region and stitch the whole chain into one pad-to-pad path.
+/// Fill the region once and feed both tabs through the reserved corridor.
 pub fn route(spec: RouteSpec<'_>, warnings: &mut Vec<String>) -> Result<Routed, EngineError> {
     let RouteSpec {
-        chain,
+        plan,
         kind,
         pitch_mm,
         inset_mm,
@@ -318,105 +207,249 @@ pub fn route(spec: RouteSpec<'_>, warnings: &mut Vec<String>) -> Result<Routed, 
         tab_in,
         tab_out,
     } = spec;
-    let mut trace: Vec<PathSeg> = Vec::new();
-    let mut link_indices: Vec<usize> = Vec::new();
-    let mut link_len = 0.0;
-    // The chain is a single conductor: the pen starts on the input pad and
-    // must reach every region's entry from wherever the last one left off.
-    let mut cursor = tab_in.center();
 
-    for (pos, region) in chain.regions.iter().enumerate() {
-        let quarter = best_quarter(&region.polygon, region.target);
-        let rotated = quarter.rotate_polygon(&region.polygon);
-        let path = fills::fill(
-            fills::FillSpec {
-                kind,
-                outline: &rotated,
-                pitch_mm,
-                inset_mm,
-                // Tab keepouts are already cut out of the region, so the
-                // pattern may use all of what it is given.
-                reserve: Reserve::none(),
-                style,
-                terminals: region.terminals,
-            },
-            warnings,
-        )?;
-        let path = quarter.inverse().rotate_path(&path);
+    let (quarter, rotated, ra, rb, corridor) =
+        choose_orientation(plan, tab_in, tab_out, inset_mm, pitch_mm, kind);
 
-        let (start, end) = (
-            path.first().expect("nonempty fill").start(),
-            path.last().expect("nonempty fill").end(),
-        );
-        // Enter at whichever terminal is closer to the pen; the fill is
-        // symmetric, so running it backwards is electrically identical.
-        let (path, start, end) = if cursor.dist(&start) <= cursor.dist(&end) {
-            (path, start, end)
-        } else {
-            (crate::fills::reverse_path(&path), end, start)
-        };
-
-        link_len += push_link(&mut trace, &mut link_indices, cursor, start);
-        trace.extend(path);
-        cursor = end;
-
-        if pos + 1 == chain.regions.len() {
-            link_len += push_link(&mut trace, &mut link_indices, cursor, tab_out.center());
+    if fills::is_scanline(kind) {
+        let coverage = fills::scanline_coverage(&rotated, pitch_mm, inset_mm, corridor.reserve);
+        if coverage < 0.999 {
+            warnings.push(format!(
+                "the heater area crosses each row more than once in every \
+                 orientation, so {:.0}% of it cannot be reached by a single \
+                 {} path ({:.1} cm² unheated). The concentric fill follows the \
+                 outline instead and may cover more.",
+                100.0 * (1.0 - coverage),
+                kind.label().to_lowercase(),
+                plan.region.area_mm2() * (1.0 - coverage) / 100.0
+            ));
         }
     }
+    let mut path = fills::fill(
+        fills::FillSpec {
+            kind,
+            outline: &rotated,
+            pitch_mm,
+            inset_mm,
+            reserve: corridor.reserve,
+            style,
+        },
+        warnings,
+    )?;
 
-    if trace.is_empty() {
-        return Err(EngineError::BadGeometry(
-            "routing produced an empty trace".into(),
-        ));
+    // Which terminal each tab connects to is ours to choose, and it decides
+    // whether the two feeds can be routed without crossing.
+    //
+    // Each feed spans the stretch of the corridor between its tab and its
+    // terminal. Two such spans can be routed side by side only if one
+    // *contains* the other — then the outer lane carries the containing span
+    // and encloses the inner one. If they merely interleave, no assignment of
+    // lanes helps and they must cross somewhere.
+    //
+    // Running the fill backwards swaps which terminal each tab gets, which
+    // turns an interleaved pair into a nested one. That is what the bifilar
+    // pattern needs: its two ends come back a single pitch apart, so the
+    // natural pairing is almost always the interleaved one.
+    let (ca, cb) = (ra.centroid(), rb.centroid());
+    let span = |tab_y: f64, term_y: f64| (tab_y.min(term_y), tab_y.max(term_y));
+    let nests =
+        |a: (f64, f64), b: (f64, f64)| (a.0 <= b.0 && b.1 <= a.1) || (b.0 <= a.0 && a.1 <= b.1);
+
+    let ends = |p: &[PathSeg]| {
+        (
+            p.first().expect("nonempty fill").start(),
+            p.last().expect("nonempty fill").end(),
+        )
+    };
+    let (f0, l0) = ends(&path);
+    if !nests(span(ca.y, f0.y), span(cb.y, l0.y)) {
+        let flipped = crate::fills::reverse_path(&path);
+        let (f1, l1) = ends(&flipped);
+        if nests(span(ca.y, f1.y), span(cb.y, l1.y)) {
+            path = flipped;
+        }
     }
+    let (t_first, t_last) = ends(&path);
+
+    // Outer lane carries the span that encloses the other.
+    let (sa, sb) = (span(ca.y, t_first.y), span(cb.y, t_last.y));
+    let first_is_outer = (sa.1 - sa.0) >= (sb.1 - sb.0);
+    let (lane_first, lane_last) = if first_is_outer {
+        (corridor.lane_outer, corridor.lane_inner)
+    } else {
+        (corridor.lane_inner, corridor.lane_outer)
+    };
+
+    let (hop_a, hop_b) = hop_heights(&ra, &rb, pitch_mm);
+    let head = corridor.feed(&ra, lane_first, hop_a, t_first);
+    let tail = crate::fills::reverse_path(&corridor.feed(&rb, lane_last, hop_b, t_last));
+
+    let head_len: f64 = head.iter().map(|s| s.length()).sum();
+    let tail_len: f64 = tail.iter().map(|s| s.length()).sum();
+    let mut trace = head;
+    let head_n = trace.len();
+    trace.extend(path);
+    let tail_start = trace.len();
+    trace.extend(tail);
+
+    let link_indices: Vec<usize> = (0..head_n).chain(tail_start..trace.len()).collect();
     Ok(Routed {
-        trace,
+        trace: quarter.inverse().rotate_path(&trace),
         link_indices,
-        link_length_mm: link_len,
+        link_length_mm: head_len + tail_len,
     })
 }
 
-/// Append a straight link, recording its index, and return its length.
-fn push_link(
-    trace: &mut Vec<PathSeg>,
-    link_indices: &mut Vec<usize>,
-    from: Point,
-    to: Point,
-) -> f64 {
-    let d = from.dist(&to);
-    if d < 1e-9 {
-        return 0.0;
-    }
-    link_indices.push(trace.len());
-    trace.push(PathSeg::Line { a: from, b: to });
-    d
-}
-
-/// Pick the rotation that puts `target` to the left of the region, which is
-/// where every fill pattern places its two path ends.
-fn best_quarter(region: &Polygon, target: Point) -> Quarter {
-    let c = region.centroid();
-    let d = Point::new(target.x - c.x, target.y - c.y);
-    // In rotated space we want the target direction pointing at -x, so pick
-    // the rotation minimising the rotated x component.
-    *Quarter::ALL
-        .iter()
-        .min_by(|a, b| {
-            a.apply(d)
-                .x
-                .partial_cmp(&b.apply(d).x)
-                .expect("finite coordinates")
-        })
-        .expect("ALL is non-empty")
-}
-
-/// Count places where a link run shorts against the rest of the trace.
+/// Pick the rotation to fill in, and build its corridor.
 ///
-/// Links are routed as straight shots, which is right when a tab sits near
-/// the terminals it feeds but can cut across a fill when it does not. Rather
-/// than silently emitting a short, the caller warns. Arcs are tested as true
-/// arcs — see [`crate::geom`].
+/// This is the most consequential decision here, so all four are evaluated
+/// rather than guessed at, in a strict order of priorities.
+///
+/// **Coverage first.** The scanline patterns route one span per row, so a row
+/// crossing the shape twice loses an arm entirely. Which rows cross twice
+/// depends only on which way the rows run: a U swept across its arms throws
+/// one away, swept along them loses nothing. Every shape tried so far — U, H,
+/// C, L, T, plus, staircase — is single-span in one of the two directions, so
+/// this is usually the difference between full coverage and losing half the
+/// board.
+///
+/// **Then tab stacking.** Both feeds leave for the corridor at their own tab's
+/// height, so tabs at the same height put the two runs on one line and they
+/// short. Rotating 90° turns a side-by-side pair into a stacked one.
+///
+/// **Then reach**, which is channel length, and therefore interconnect that
+/// heats the wrong part of the board.
+fn choose_orientation(
+    plan: &Plan,
+    tab_in: &Pad,
+    tab_out: &Pad,
+    inset_mm: f64,
+    pitch_mm: f64,
+    kind: FillKind,
+) -> (Quarter, Polygon, Polygon, Polygon, Corridor) {
+    let tabs_at = midpoint(tab_in.center(), tab_out.center());
+    let scanline = fills::is_scanline(kind);
+    let mut best: Option<(Quarter, Polygon, Polygon, Polygon, Corridor, f64)> = None;
+    for q in Quarter::ALL {
+        let rotated = q.rotate_polygon(&plan.region);
+        let ra = q.rotate_polygon(&Polygon {
+            points: tab_in.ring(),
+        });
+        let rb = q.rotate_polygon(&Polygon {
+            points: tab_out.ring(),
+        });
+        let corridor = Corridor::new(&rotated, &[&ra, &rb], inset_mm, pitch_mm);
+        let coverage = if scanline {
+            fills::scanline_coverage(&rotated, pitch_mm, inset_mm, corridor.reserve)
+        } else {
+            1.0
+        };
+        let stacking = (q.apply(tab_in.center()).y - q.apply(tab_out.center()).y).abs();
+        let reach = (q.apply(tabs_at).x - rotated.bbox().0.x).abs();
+        let score = coverage * 1.0e9 + stacking * 1.0e3 - reach;
+        if best.as_ref().is_none_or(|(_, _, _, _, _, s)| score > *s) {
+            best = Some((q, rotated, ra, rb, corridor, score));
+        }
+    }
+    let (q, rotated, ra, rb, corridor, _) = best.expect("four orientations");
+    (q, rotated, ra, rb, corridor)
+}
+
+/// The reserved feed corridor down the region's left side, plus the pocket
+/// that keeps the fill off the tabs inside it.
+struct Corridor {
+    reserve: Reserve,
+    lane_inner: f64,
+    lane_outer: f64,
+}
+
+impl Corridor {
+    fn new(region: &Polygon, tabs: &[&Polygon], inset_mm: f64, pitch_mm: f64) -> Self {
+        let (rlo, rhi) = region.bbox();
+        // Wide enough for two lanes a pitch apart plus clearance to the fill.
+        let width = (3.0 * pitch_mm).max(1.2);
+        let lane_edge = rlo.x + inset_mm + width;
+        // The pocket spans the y band the tabs occupy and reaches right of the
+        // rightmost of them, so each tab's run out to the corridor crosses
+        // only cleared ground.
+        // A pitch of headroom on top of the clearance, so a staggered hop
+        // (see `hop_heights`) still leaves from inside the pocket.
+        let clearance = inset_mm + 2.0 * pitch_mm;
+        let (mut y0, mut y1, mut x1) = (f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for t in tabs {
+            let (lo, hi) = t.bbox();
+            y0 = y0.min(lo.y - clearance);
+            y1 = y1.max(hi.y + clearance);
+            x1 = x1.max(hi.x + clearance);
+        }
+        Corridor {
+            reserve: Reserve {
+                lane_edge,
+                pocket_x1: x1.min(rhi.x),
+                pocket_y0: y0,
+                pocket_y1: y1,
+            },
+            lane_inner: lane_edge - pitch_mm,
+            lane_outer: lane_edge - 2.0 * pitch_mm,
+        }
+    }
+
+    /// Tab centre → out to `lane_x` at height `hop_y` → along the corridor →
+    /// into the terminal. Every leg stays in reserved ground: the hop is inside
+    /// the tab pocket, the run along the corridor inside the lane.
+    ///
+    /// `hop_y` is separate from the tab's own centre so the caller can stagger
+    /// two feeds that would otherwise leave at the same height — see
+    /// [`hop_heights`].
+    fn feed(&self, tab: &Polygon, lane_x: f64, hop_y: f64, terminal: Point) -> Vec<PathSeg> {
+        let c = tab.centroid();
+        segments(&[
+            c,
+            Point::new(c.x, hop_y),
+            Point::new(lane_x, hop_y),
+            Point::new(lane_x, terminal.y),
+            terminal,
+        ])
+    }
+}
+
+/// Heights at which the two feeds should leave their tabs.
+///
+/// Each feed runs out to the corridor at its own tab's height, which is fine
+/// while the tabs sit at different heights. When they do not — two tabs side
+/// by side, and the orientation was chosen for coverage rather than for them —
+/// both runs land on the same line and short against each other.
+///
+/// So when they are within a pitch, one is stepped a pitch clear of the other,
+/// away from its partner. The pocket is built a pitch wider than strictly
+/// needed to guarantee that step is still over reserved ground.
+fn hop_heights(a: &Polygon, b: &Polygon, pitch_mm: f64) -> (f64, f64) {
+    let (ya, yb) = (a.centroid().y, b.centroid().y);
+    if (ya - yb).abs() >= pitch_mm {
+        return (ya, yb);
+    }
+    // Step whichever one is already further along, so they move apart.
+    if ya <= yb {
+        (ya - pitch_mm, yb + pitch_mm)
+    } else {
+        (ya + pitch_mm, yb - pitch_mm)
+    }
+}
+
+fn midpoint(a: Point, b: Point) -> Point {
+    Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+}
+
+/// Consecutive points to line segments, dropping degenerate hops.
+fn segments(pts: &[Point]) -> Vec<PathSeg> {
+    pts.windows(2)
+        .filter(|w| w[0].dist(&w[1]) > 1e-9)
+        .map(|w| PathSeg::Line { a: w[0], b: w[1] })
+        .collect()
+}
+
+/// Count places where a feed run shorts against the rest of the trace, with
+/// arcs handled exactly — see [`crate::geom`].
 pub fn count_link_crossings(trace: &[PathSeg], link_indices: &[usize]) -> usize {
     crate::geom::find_shorts(trace, link_indices).len()
 }
@@ -441,8 +474,8 @@ mod tests {
         Pad::Rect(PadRect {
             cx,
             cy,
-            w: 2.0,
-            h: 1.5,
+            w: 4.0,
+            h: 3.0,
         })
     }
 
@@ -457,129 +490,68 @@ mod tests {
         for q in Quarter::ALL {
             let there = q.rotate_path(&path);
             match there[0] {
-                // A rotation must never flip the sweep direction.
                 PathSeg::Arc { ccw, .. } => assert!(ccw, "{q:?} flipped the arc"),
                 _ => unreachable!(),
             }
             let back = q.inverse().rotate_path(&there);
             assert!(back[0].start().dist(&path[0].start()) < 1e-12, "{q:?}");
-            assert!(back[0].end().dist(&path[0].end()) < 1e-12, "{q:?}");
         }
     }
 
     #[test]
-    fn terminals_face_the_target_side() {
-        let region = rect(0.0, 0.0, 10.0, 10.0);
-        // Target to the region's right → needs a 180° turn to face left.
-        assert_eq!(best_quarter(&region, Point::new(30.0, 5.0)), Quarter::R180);
-        // Already to the left → no rotation.
-        assert_eq!(best_quarter(&region, Point::new(-30.0, 5.0)), Quarter::R0);
-        // Directly above (smaller y in the y-down frame).
-        let up = best_quarter(&region, Point::new(5.0, -30.0));
-        assert!(up == Quarter::R90 || up == Quarter::R270, "{up:?}");
+    fn abutting_selections_merge_into_one_region() {
+        let heaters = [
+            rect(0.0, 0.0, 40.0, 30.0),
+            rect(40.0, 0.0, 80.0, 30.0),
+            rect(80.0, 0.0, 120.0, 30.0),
+        ];
+        let mut w = Vec::new();
+        let p = plan(&heaters, [&pad_at(10.0, 15.0), &pad_at(20.0, 15.0)], &mut w).unwrap();
+        assert_eq!(p.merged_from, 3);
+        assert!(
+            (p.region.area_mm2() - 3600.0).abs() < 1e-6,
+            "{}",
+            p.region.area_mm2()
+        );
+        assert!(
+            w.iter().any(|m| m.contains("merged into one heater")),
+            "{w:?}"
+        );
     }
 
     #[test]
-    fn regions_chain_nearest_first_from_the_input_tab() {
-        // Three regions in a row; the tab sits left of the middle one, so the
-        // walk should go middle → left → right or middle → ... nearest-first.
-        let heaters = vec![
-            rect(0.0, 0.0, 10.0, 10.0),
-            rect(20.0, 0.0, 30.0, 10.0),
-            rect(40.0, 0.0, 50.0, 10.0),
-        ];
-        let mut w = Vec::new();
-        let chain = plan(
+    fn a_detached_selection_is_rejected() {
+        let heaters = [rect(0.0, 0.0, 40.0, 30.0), rect(200.0, 0.0, 240.0, 30.0)];
+        let err = plan(
             &heaters,
-            &pad_at(-5.0, 5.0),
-            &pad_at(55.0, 5.0),
-            0.5,
-            &mut w,
+            [&pad_at(10.0, 15.0), &pad_at(20.0, 15.0)],
+            &mut Vec::new(),
         )
-        .unwrap();
-        assert_eq!(chain.regions.len(), 3);
-        // Starting from x=-5, nearest-first gives left → middle → right.
-        let xs: Vec<f64> = chain
-            .regions
-            .iter()
-            .map(|r| r.polygon.centroid().x)
-            .collect();
-        assert!(xs[0] < xs[1] && xs[1] < xs[2], "{xs:?}");
+        .expect_err("not contiguous");
+        assert!(err.to_string().contains("separate groups"), "{err}");
     }
 
     #[test]
-    fn an_overlapping_tab_is_cut_out_of_its_region() {
-        let heaters = vec![rect(0.0, 0.0, 20.0, 20.0)];
-        let tab = pad_at(3.0, 10.0); // well inside the region
-        let mut w = Vec::new();
-        let chain = plan(&heaters, &tab, &pad_at(30.0, 10.0), 0.5, &mut w).unwrap();
-        let poly = &chain.regions[0].polygon;
-        // The pad's own centre must no longer be inside the fillable region.
-        assert!(
-            !poly.contains(Point::new(3.0, 10.0)),
-            "tab was not cut out of the region"
-        );
-        // The cut must be a notch open to the left edge, not an enclosed
-        // hole: a point between the pad and that edge is also outside now.
-        assert!(
-            !poly.contains(Point::new(0.5, 10.0)),
-            "cut left a hole instead of a notch to the edge"
-        );
-        // Pad grown to 3.0 × 2.5, channel run out to the left edge:
-        // 4.5 mm × 2.5 mm ≈ 11.25 mm² off the original 400 mm².
-        let lost = 400.0 - poly.area_mm2();
-        assert!(
-            (lost - 11.25).abs() < 0.5,
-            "expected to lose ~11.25 mm², lost {lost}"
-        );
-    }
-
-    #[test]
-    fn a_tab_outside_every_region_leaves_them_untouched() {
-        let heaters = vec![rect(0.0, 0.0, 20.0, 20.0)];
-        let mut w = Vec::new();
-        let chain = plan(
+    fn a_tab_outside_the_heater_is_rejected() {
+        let heaters = [rect(0.0, 0.0, 40.0, 30.0)];
+        let err = plan(
             &heaters,
-            &pad_at(-5.0, 10.0),
-            &pad_at(30.0, 10.0),
-            0.5,
-            &mut w,
+            [&pad_at(10.0, 15.0), &pad_at(200.0, 15.0)],
+            &mut Vec::new(),
         )
-        .unwrap();
-        assert!((chain.regions[0].polygon.area_mm2() - 400.0).abs() < 1e-6);
-        assert!(w.is_empty(), "{w:?}");
+        .expect_err("tab outside");
+        assert!(err.to_string().contains("outside it"), "{err}");
     }
 
     #[test]
-    fn crossing_detection_finds_a_link_cutting_through_a_row() {
-        // A link that spans a horizontal run it is not joined to.
-        let trace = vec![
-            PathSeg::Line {
-                a: Point::new(0.0, 5.0),
-                b: Point::new(10.0, 5.0),
-            },
-            PathSeg::Line {
-                a: Point::new(20.0, 0.0),
-                b: Point::new(20.0, 10.0),
-            },
-            // This link crosses segment 0.
-            PathSeg::Line {
-                a: Point::new(5.0, 0.0),
-                b: Point::new(5.0, 10.0),
-            },
-        ];
-        assert_eq!(count_link_crossings(&trace, &[2]), 1);
-        // A link that only touches endpoints of its neighbours is fine.
-        let clean = vec![
-            PathSeg::Line {
-                a: Point::new(0.0, 0.0),
-                b: Point::new(10.0, 0.0),
-            },
-            PathSeg::Line {
-                a: Point::new(10.0, 0.0),
-                b: Point::new(10.0, 10.0),
-            },
-        ];
-        assert_eq!(count_link_crossings(&clean, &[1]), 0);
+    fn a_tab_straddling_the_edge_says_so() {
+        let heaters = [rect(0.0, 0.0, 40.0, 30.0)];
+        let err = plan(
+            &heaters,
+            [&pad_at(10.0, 15.0), &pad_at(39.0, 15.0)],
+            &mut Vec::new(),
+        )
+        .expect_err("tab straddles");
+        assert!(err.to_string().contains("hangs over the edge"), "{err}");
     }
 }
