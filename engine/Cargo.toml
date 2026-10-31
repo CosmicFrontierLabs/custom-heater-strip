@@ -14,7 +14,7 @@ usvg = { version = "0.45", default-features = false }
 shared = { path = "../shared" }
 cavalier_contours = "0.7.0"
 dxf = "0.6"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 
 # `dxf` depends on `uuid`, which refuses to build for wasm without being told
