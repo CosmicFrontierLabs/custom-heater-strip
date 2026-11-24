@@ -1231,7 +1231,7 @@ mod tests {
             .unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         for expected in resp.gerbers.keys() {
             assert!(names.contains(expected), "{expected} missing from zip");
